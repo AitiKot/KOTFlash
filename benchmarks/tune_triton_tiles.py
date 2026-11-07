@@ -168,6 +168,8 @@ def main():
 
     scale = 1.0 / math.sqrt(args.head_dim)
     results = []
+    failed_configs = []
+    attempted_configs = 0
     # These dimensions are intentionally bounded: all candidates are tested
     # on the real SM75 device, and resource failures are recorded, not fatal.
     for block_m in (32, 64):
@@ -178,6 +180,7 @@ def main():
                         f"BM={block_m:2d} BN={block_n:3d} "
                         f"warps={num_warps} stages={num_stages}"
                     )
+                    attempted_configs += 1
                     try:
                         def fn():
                             return attention_forward(
@@ -226,6 +229,15 @@ def main():
                             flush=True,
                         )
                     except Exception as exc:
+                        failure = {
+                            "BM": block_m,
+                            "BN": block_n,
+                            "num_warps": num_warps,
+                            "num_stages": num_stages,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                        failed_configs.append(failure)
                         print(
                             f"{label} FAILED: {type(exc).__name__}: {exc}",
                             flush=True,
@@ -249,7 +261,10 @@ def main():
         "sdpa_expanded_efficient_precomputed_median_ms": efficient_ms,
         "sdpa_expanded_auto_inclusive_median_ms": expanded_inclusive_ms,
         "best_configs": results[:8],
+        "attempted_config_count": attempted_configs,
         "successful_config_count": len(results),
+        "failed_config_count": len(failed_configs),
+        "failed_configs": failed_configs,
         "all_configs": results,
     }
     print("\n" + json.dumps(report, indent=2, default=str))
