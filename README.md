@@ -15,9 +15,9 @@ KOTFlash is an independent, research-stage implementation. The first public mile
 | Triton online-softmax forward | Experimental; FP16, SM75, Triton 3.2.x, head_dim 16–128 |
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
-| Backward | Experimental fused Triton dQ and dK/dV kernels with block recomputation; requires fresh T4 validation |
-| Physical T4 validation | An earlier user-run test revision passed 11/11 tests on Tesla T4; expanded backward tests for the current revision still need a fresh T4 run |
-| Fused SM75 backward | Implemented experimentally; physical-T4 validation pending |
+| Backward | Fused Triton dQ/dK/dV; previous serial dK/dV path passed T4 validation, new split-query path awaits T4 validation |
+| Physical T4 validation | Previous fused-backward revision passed 34/34 tests and a synthetic decoder-block benchmark on Tesla T4; newest split-query kernel is not yet validated |
+| Fused SM75 backward | Initial fused dQ/dK/dV validated on T4; long-sequence split reduction remains experimental |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
 
