@@ -164,6 +164,7 @@ def main():
     native_gqa_ms = baselines.get("native_gqa_auto", {}).get("median_ms")
     expanded_auto_ms = baselines.get("expanded_kv_auto_precomputed", {}).get("median_ms")
     efficient_ms = baselines.get("expanded_kv_efficient_precomputed", {}).get("median_ms")
+    expanded_inclusive_ms = baselines.get("expanded_kv_auto_inclusive", {}).get("median_ms")
 
     scale = 1.0 / math.sqrt(args.head_dim)
     results = []
@@ -204,6 +205,9 @@ def main():
                             "speedup_vs_sdpa_efficient": (
                                 efficient_ms / elapsed if efficient_ms else None
                             ),
+                            "speedup_vs_sdpa_expanded_inclusive": (
+                                expanded_inclusive_ms / elapsed if expanded_inclusive_ms else None
+                            ),
                             "max_abs_error": error,
                         }
                         results.append(row)
@@ -214,6 +218,8 @@ def main():
                             ratios.append(f"auto-expanded={expanded_auto_ms / elapsed:.2f}x")
                         if efficient_ms:
                             ratios.append(f"efficient={efficient_ms / elapsed:.2f}x")
+                        if expanded_inclusive_ms:
+                            ratios.append(f"incl-expand={expanded_inclusive_ms / elapsed:.2f}x")
                         print(
                             f"{label} | {elapsed:.4f} ms | "
                             f"{' '.join(ratios)} | error={error:.6g}",
@@ -241,6 +247,7 @@ def main():
         "sdpa_native_gqa_median_ms": native_gqa_ms,
         "sdpa_expanded_auto_precomputed_median_ms": expanded_auto_ms,
         "sdpa_expanded_efficient_precomputed_median_ms": efficient_ms,
+        "sdpa_expanded_auto_inclusive_median_ms": expanded_inclusive_ms,
         "best_configs": results[:8],
         "successful_config_count": len(results),
         "all_configs": results,
