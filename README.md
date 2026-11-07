@@ -106,6 +106,15 @@ python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 16 --
 
 The benchmark compares SDPA, Triton and auto on the same input shape. It reports forward latency, forward+backward latency, incremental peak allocated memory, and maximum absolute error. Record the GPU model, driver, CUDA runtime, PyTorch and Triton versions with any published result. Benchmark results from other GPUs are not T4 results.
 
+To measure whether KOTFlash helps an actual training step (rather than attention in isolation), run the decoder-block benchmark:
+
+```bash
+python benchmarks/benchmark_decoder_block.py --batch 2 --seq 512 --q-heads 8 --kv-heads 2 --head-dim 64
+```
+
+It includes Q/K/V/output projections, attention, an MLP, forward, backward and an AdamW update. The report includes median step time, tokens/second, incremental peak memory and output error versus SDPA. This is a small decoder-block test, not a full language-model training result; use your own model and sequence lengths for the final decision.
+
+
 For a T4-specific forward tile sweep, run:
 
 ```bash
