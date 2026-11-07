@@ -35,7 +35,8 @@ def median_cuda_ms(fn, warmup: int, iterations: int) -> float:
     )
 
 
-def sdpa(q, k, v, causal: bool):
+def sdpa_native_gqa(q, k, v, causal: bool):
+    """Use PyTorch's native enable_gqa path (may fall back to math on SM75)."""
     try:
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=causal, enable_gqa=(q.shape[1] != k.shape[1])
@@ -48,6 +49,19 @@ def sdpa(q, k, v, causal: bool):
             q, k.repeat_interleave(groups, dim=1),
             v.repeat_interleave(groups, dim=1), is_causal=causal
         )
+
+
+def sdpa_expanded(q, k_expanded, v_expanded, causal: bool):
+    """SDPA with KV heads expanded before the call, allowing fused backends."""
+    return F.scaled_dot_product_attention(
+        q, k_expanded, v_expanded, is_causal=causal
+    )
+
+
+def sdpa_forced_efficient(q, k_expanded, v_expanded, causal: bool):
+    """Force PyTorch's memory-efficient backend; raises if unsupported."""
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        return sdpa_expanded(q, k_expanded, v_expanded, causal)
 
 
 def main():
@@ -102,9 +116,53 @@ def main():
     ).contiguous()
     v = torch.randn_like(k)
 
-    reference_fn = lambda: sdpa(q, k, v, args.causal)
-    reference = reference_fn()
-    sdpa_ms = median_cuda_ms(reference_fn, args.warmup, args.iterations)
+    # Native enable_gqa is retained as a diagnostic baseline. In PyTorch
+    # versions where GQA is restricted to math/flash, T4 (SM75) can be forced
+    # onto the math path because flash is unavailable. Expand KV heads once
+    # to let SDPA independently select an SM75-compatible fused backend.
+    native_gqa_fn = lambda: sdpa_native_gqa(q, k, v, args.causal)
+    reference = native_gqa_fn()
+
+    groups = args.q_heads // args.kv_heads
+    k_expanded = k.repeat_interleave(groups, dim=1).contiguous()
+    v_expanded = v.repeat_interleave(groups, dim=1).contiguous()
+    expanded_auto_fn = lambda: sdpa_expanded(q, k_expanded, v_expanded, args.causal)
+    expanded_efficient_fn = lambda: sdpa_forced_efficient(
+        q, k_expanded, v_expanded, args.causal
+    )
+    expanded_inclusive_fn = lambda: sdpa_expanded(
+        q,
+        k.repeat_interleave(groups, dim=1).contiguous(),
+        v.repeat_interleave(groups, dim=1).contiguous(),
+        args.causal,
+    )
+
+    baselines = {}
+
+    def profile_baseline(name, fn):
+        try:
+            output = fn()
+            torch.cuda.synchronize()
+            error = (output.float() - reference.float()).abs().max().item()
+            elapsed = median_cuda_ms(fn, args.warmup, args.iterations)
+            baselines[name] = {"median_ms": elapsed, "max_abs_error": error}
+            print(
+                f"SDPA {name}: {elapsed:.4f} ms | "
+                f"error={error:.6g}",
+                flush=True,
+            )
+        except Exception as exc:
+            baselines[name] = {"error": f"{type(exc).__name__}: {exc}"}
+            print(f"SDPA {name} UNAVAILABLE: {type(exc).__name__}: {exc}", flush=True)
+
+    profile_baseline("native_gqa_auto", native_gqa_fn)
+    profile_baseline("expanded_kv_auto_precomputed", expanded_auto_fn)
+    profile_baseline("expanded_kv_efficient_precomputed", expanded_efficient_fn)
+    profile_baseline("expanded_kv_auto_inclusive", expanded_inclusive_fn)
+
+    native_gqa_ms = baselines.get("native_gqa_auto", {}).get("median_ms")
+    expanded_auto_ms = baselines.get("expanded_kv_auto_precomputed", {}).get("median_ms")
+    efficient_ms = baselines.get("expanded_kv_efficient_precomputed", {}).get("median_ms")
 
     scale = 1.0 / math.sqrt(args.head_dim)
     results = []
@@ -136,13 +194,28 @@ def main():
                             "num_warps": num_warps,
                             "num_stages": num_stages,
                             "median_ms": elapsed,
-                            "speedup_vs_sdpa": sdpa_ms / elapsed,
+                            "speedup_vs_sdpa_native_gqa": (
+                                native_gqa_ms / elapsed if native_gqa_ms else None
+                            ),
+                            "speedup_vs_sdpa_expanded_auto": (
+                                expanded_auto_ms / elapsed if expanded_auto_ms else None
+                            ),
+                            "speedup_vs_sdpa_efficient": (
+                                efficient_ms / elapsed if efficient_ms else None
+                            ),
                             "max_abs_error": error,
                         }
                         results.append(row)
+                        ratios = []
+                        if native_gqa_ms:
+                            ratios.append(f"native={native_gqa_ms / elapsed:.2f}x")
+                        if expanded_auto_ms:
+                            ratios.append(f"auto-expanded={expanded_auto_ms / elapsed:.2f}x")
+                        if efficient_ms:
+                            ratios.append(f"efficient={efficient_ms / elapsed:.2f}x")
                         print(
                             f"{label} | {elapsed:.4f} ms | "
-                            f"{sdpa_ms / elapsed:.3f}x | error={error:.6g}",
+                            f"{' '.join(ratios)} | error={error:.6g}",
                             flush=True,
                         )
                     except Exception as exc:
@@ -158,12 +231,15 @@ def main():
         "torch": torch.__version__,
         "triton": triton.__version__,
         "t4_compatibility_override": args.allow_unsupported_triton,
+        "sdpa_baselines": baselines,
         "shape": {
             "B": args.batch, "H_Q": args.q_heads, "H_KV": args.kv_heads,
             "SEQ": args.seq, "D": args.head_dim,
         },
         "causal": args.causal,
-        "sdpa_median_ms": sdpa_ms,
+        "sdpa_native_gqa_median_ms": native_gqa_ms,
+        "sdpa_expanded_auto_precomputed_median_ms": expanded_auto_ms,
+        "sdpa_expanded_efficient_precomputed_median_ms": efficient_ms,
         "best_configs": results[:8],
         "successful_config_count": len(results),
         "all_configs": results,
