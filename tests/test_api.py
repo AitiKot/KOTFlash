@@ -38,6 +38,9 @@ def test_rejects_invalid_layout():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_triton_forward_and_grad_if_available():
     pytest.importorskip("triton")
+    from kotflash import triton_turing_supported
+    if not triton_turing_supported():
+        pytest.skip("Upstream Triton 3.2.x or a compatible Turing-enabled build is required")
     if torch.cuda.get_device_capability()[0:2] != (7, 5):
         pytest.skip("This test is targeted at Turing SM75")
     torch.manual_seed(2)
