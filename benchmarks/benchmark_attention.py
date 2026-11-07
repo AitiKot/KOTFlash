@@ -169,6 +169,11 @@ def main():
                 error = (output.float() - reference.float()).abs().max().item()
                 del output
                 f_ms, f_mem = timed(fwd, args.iterations, device)
+                # Do not count stale warm-up gradients in the backward
+                # incremental-memory baseline.
+                q.grad = None
+                k.grad = None
+                v.grad = None
                 b_ms, b_mem = timed(bwd, train_iterations, device)
                 sample = samples[name]
                 sample["forward"].append(f_ms)
