@@ -31,6 +31,23 @@ def test_triton_forward_matches_sdpa(head_dim, causal):
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
 
 
+@pytest.mark.parametrize("seq", [128, 256, 512, 1024, 2048])
+def test_t4_auto_profile_matches_expanded_sdpa(seq):
+    torch.manual_seed(13)
+    q = torch.randn(2, 8, seq, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(2, 2, seq, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+
+    actual = attention(q, k, v, causal=True, backend="auto")
+    expected = F.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        is_causal=True,
+    )
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
 @pytest.mark.parametrize(
     ("hq", "hkv", "sq", "sk", "head_dim", "causal"),
     [
