@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Reproducible KOTFlash vs PyTorch SDPA benchmark."""
 from __future__ import annotations
 
@@ -7,7 +8,6 @@ import json
 import time
 
 import torch
-import torch.nn.functional as F
 
 from kotflash import attention
 
@@ -21,14 +21,18 @@ def timed(fn, warmup: int, iterations: int, device):
     for _ in range(warmup):
         fn()
     sync(device)
+    baseline = None
     if device.type == "cuda":
+        baseline = torch.cuda.memory_allocated(device)
         torch.cuda.reset_peak_memory_stats(device)
     start = time.perf_counter()
     for _ in range(iterations):
         fn()
     sync(device)
     elapsed = (time.perf_counter() - start) * 1000.0 / iterations
-    peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+    peak = None
+    if device.type == "cuda":
+        peak = max(0, torch.cuda.max_memory_allocated(device) - baseline)
     return elapsed, peak
 
 
@@ -46,17 +50,25 @@ def main():
     p.add_argument("--iterations", type=int, default=100)
     args = p.parse_args()
 
+    if args.batch <= 0 or args.q_heads <= 0 or args.kv_heads <= 0:
+        p.error("batch and head counts must be positive")
+    if args.q_heads % args.kv_heads:
+        p.error("--q-heads must be divisible by --kv-heads")
+    if args.seq <= 0 or (args.kv_seq is not None and args.kv_seq <= 0):
+        p.error("sequence lengths must be positive")
+    if args.head_dim <= 0 or args.warmup < 0 or args.iterations <= 0:
+        p.error("head dimension must be positive, warmup non-negative and iterations positive")
+
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        p.error("CUDA was requested but torch.cuda.is_available() is False")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     sk = args.kv_seq or args.seq
     q = torch.randn(args.batch, args.q_heads, args.seq, args.head_dim, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(args.batch, args.kv_heads, sk, args.head_dim, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
-    repeat = args.q_heads // args.kv_heads
-    kr = k.repeat_interleave(repeat, dim=1) if repeat > 1 else k
-    vr = v.repeat_interleave(repeat, dim=1) if repeat > 1 else v
 
-    reference = lambda: F.scaled_dot_product_attention(q, kr, vr, is_causal=args.causal)
+    reference = lambda: attention(q, k, v, causal=args.causal, backend="sdpa")
     report = {
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
@@ -84,9 +96,9 @@ def main():
     )
     report["pytorch_sdpa"] = {
         "forward_ms": ref_ms,
-        "forward_peak_allocated_bytes": ref_mem,
+        "forward_incremental_peak_allocated_bytes": ref_mem,
         "forward_backward_ms": ref_train_ms,
-        "forward_backward_peak_allocated_bytes": ref_train_mem,
+        "forward_backward_incremental_peak_allocated_bytes": ref_train_mem,
     }
 
     for backend in ("triton", "auto"):
@@ -104,12 +116,14 @@ def main():
                 y.float().square().mean().backward()
 
             fwd_ms, fwd_mem = timed(fn, args.warmup, args.iterations, device)
-            train_ms, train_mem = timed(train_step, max(2, args.warmup // 4), max(5, args.iterations // 4), device)
+            train_ms, train_mem = timed(
+                train_step, max(2, args.warmup // 4), max(5, args.iterations // 4), device
+            )
             report[backend] = {
                 "forward_ms": fwd_ms,
-                "forward_peak_allocated_bytes": fwd_mem,
+                "forward_incremental_peak_allocated_bytes": fwd_mem,
                 "forward_backward_ms": train_ms,
-                "forward_backward_peak_allocated_bytes": train_mem,
+                "forward_backward_incremental_peak_allocated_bytes": train_mem,
                 "max_abs_error_vs_sdpa": diff,
             }
         except Exception as exc:

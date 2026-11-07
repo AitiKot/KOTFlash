@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Public KOTFlash attention API."""
 from __future__ import annotations
 
@@ -15,6 +16,12 @@ def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise TypeError("q, k and v must be torch.Tensor instances")
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("Expected q/k/v in [batch, heads, sequence, head_dim] layout")
+    if q.shape[0] == 0:
+        raise ValueError("Batch dimension must be non-zero")
+    if q.shape[1] == 0 or k.shape[1] == 0:
+        raise ValueError("Head dimensions must be non-zero")
+    if q.shape[-1] == 0:
+        raise ValueError("Head dimension must be non-zero")
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
         raise ValueError("Batch dimensions must match")
     if k.shape != v.shape:
@@ -35,19 +42,32 @@ def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
     kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
     if scale is not None:
         kwargs["scale"] = scale
+
     if q.shape[1] != k.shape[1]:
         try:
-            kwargs["enable_gqa"] = True
-            return F.scaled_dot_product_attention(q, k, v, **kwargs)
-        except TypeError:
+            # GQA is implemented natively by modern PyTorch SDPA.
+            return F.scaled_dot_product_attention(q, k, v, enable_gqa=True, **kwargs)
+        except TypeError as exc:
+            # Older PyTorch releases do not expose enable_gqa. Only fall back
+            # for that specific API mismatch, not for arbitrary TypeErrors.
+            if "enable_gqa" not in str(exc):
+                raise
             repeat = q.shape[1] // k.shape[1]
             k = k.repeat_interleave(repeat, dim=1)
             v = v.repeat_interleave(repeat, dim=1)
     return F.scaled_dot_product_attention(q, k, v, **kwargs)
 
 
-def _blockwise_backward(q, k, v, out, lse, grad_out, *, causal: bool, scale: float, q_block: int = 32, kv_block: int = 64):
-    """Memory-bounded reference backward; recomputes score tiles instead of storing SxS."""
+def _blockwise_backward(
+    q, k, v, out, lse, grad_out, *, causal: bool, scale: float,
+    q_block: int = 32, kv_block: int = 64,
+):
+    """Memory-bounded reference backward; recomputes score tiles instead of storing SxS.
+
+    This is intentionally a correctness-oriented PyTorch implementation, not a
+    fused high-performance backward kernel. Its Python loops make it slow for
+    long sequences; use it for validation until a native SM75 backward lands.
+    """
     bsz, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
     group = hq // hkv
@@ -101,7 +121,10 @@ class _TritonAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         q, k, v, out, lse = ctx.saved_tensors
-        grads = _blockwise_backward(q, k, v, out, lse, grad_out.contiguous(), causal=ctx.causal, scale=ctx.scale)
+        grads = _blockwise_backward(
+            q, k, v, out, lse, grad_out.contiguous(),
+            causal=ctx.causal, scale=ctx.scale,
+        )
         return grads[0], grads[1], grads[2], None, None
 
 
@@ -114,31 +137,44 @@ def attention(
     scale: Optional[float] = None,
     backend: str = "auto",
 ) -> torch.Tensor:
-    """Scaled dot-product attention with MHA/GQA/MQA support.
+    """Scaled dot-product attention with MHA, GQA and MQA support.
 
-    Args:
-        q, k, v: tensors shaped [B, H, S, D].
-        causal: apply upper-left causal mask (key position <= query position).
-        scale: multiplier for QK^T; defaults to 1/sqrt(head_dim).
-        backend: auto, triton or sdpa.
+    Tensors use [batch, heads, sequence, head_dim] layout. For GQA/MQA,
+    Hq must be divisible by Hkv. The causal mask is upper-left aligned
+    (key position <= query position), matching PyTorch SDPA.
 
-    The Triton forward is custom. Its first-release backward is a blockwise
-    recomputation implementation intended for correctness experiments.
+    backend is one of auto, triton or sdpa. The Triton forward requires
+    CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128]. Its backward
+    is a slow, blockwise PyTorch reference implementation.
     """
     _validate(q, k, v)
+    if not isinstance(causal, bool):
+        raise TypeError("causal must be a bool")
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
+    else:
+        try:
+            scale = float(scale)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("scale must be a finite real number or None") from exc
+        if not math.isfinite(scale):
+            raise ValueError("scale must be finite")
     if backend not in {"auto", "triton", "sdpa"}:
         raise ValueError("backend must be one of: auto, triton, sdpa")
 
     capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)
     can_triton = (
-        q.is_cuda and q.dtype == torch.float16 and triton_turing_supported()
-        and q.shape[-1] <= 128
+        q.is_cuda
+        and q.dtype == torch.float16
+        and triton_turing_supported()
+        and 16 <= q.shape[-1] <= 128
         and capability == (7, 5)
     )
     if backend == "triton" and not can_triton:
-        raise RuntimeError("Triton backend requires upstream Triton 3.2.x (or a compatible Turing-enabled build), CUDA SM75, FP16 and head_dim <= 128")
+        raise RuntimeError(
+            "Triton backend requires Triton 3.2.x (or a compatible Turing-enabled build), "
+            "CUDA SM75, FP16 and 16 <= head_dim <= 128"
+        )
     if backend == "triton" or (backend == "auto" and can_triton):
         return _TritonAttention.apply(q, k, v, causal, float(scale))
     return _sdpa(q, k, v, causal=causal, scale=scale)
