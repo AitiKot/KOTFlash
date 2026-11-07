@@ -2,9 +2,9 @@
 
 **Experimental memory-efficient attention for NVIDIA Turing (SM75), exposed through a general PyTorch API.**
 
-KOTFlash is an independent, research-stage implementation. The first public milestone contains a PyTorch SDPA fallback and an experimental Triton online-softmax forward kernel. Backward recomputes attention blocks with batched PyTorch operations. This is usable for correctness checks and experimental training, but it is not a fused GPU backward kernel and has not been shown to speed up full-model training.
+KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). The custom path has passed user-run correctness tests on a Tesla T4 and has shown gains for selected attention and synthetic decoder-block shapes. It remains experimental: performance varies by sequence length, and full-model training speedup has not been established.
 
-> **Status: alpha / user-reported Tesla T4 validation: 11/11 Triton integration tests passed. Initial tile profiling found limited forward wins on tested shapes; no general speedup is claimed.** Run the correctness suite and benchmarks on your hardware before using it for training.
+> **Status: alpha / user-reported Tesla T4 validation: 37/37 tests passed on PyTorch 2.6.0+cu124 and Triton 3.2.0, including long-sequence split-backward cases.** Run the correctness suite and benchmarks on your own hardware before using it for training.
 
 ## What works today
 
@@ -15,9 +15,9 @@ KOTFlash is an independent, research-stage implementation. The first public mile
 | Triton online-softmax forward | Experimental; FP16, SM75, Triton 3.2.x, head_dim 16–128 |
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
-| Backward | Fused Triton dQ/dK/dV; previous serial dK/dV path passed T4 validation, new split-query path awaits T4 validation |
-| Physical T4 validation | Previous fused-backward revision passed 34/34 tests and a synthetic decoder-block benchmark on Tesla T4; newest split-query kernel is not yet validated |
-| Fused SM75 backward | Initial fused dQ/dK/dV validated on T4; long-sequence split reduction remains experimental |
+| Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
+| Physical T4 validation | User-reported Tesla T4 run: 37/37 tests passed, including long split-query gradient cases |
+| Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
 
@@ -135,6 +135,16 @@ Environment: Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=
 
 Standalone attention forward+backward versus expanded-KV SDPA measured 0.95x, 0.86x, 0.89x, 0.56x and 0.55x at sequence lengths 128, 256, 512, 1024 and 2048 respectively. This identifies long-sequence dK/dV backward parallelism as the next optimization target. Forward-only Triton became faster than expanded-KV SDPA at 1024 (1.34x) and 2048 (2.04x), with lower peak allocations in all tested cases. These are single-run, user-reported measurements of the previous serial dK/dV implementation; the new split-query reduction has not yet been measured on T4. The decoder benchmark is a synthetic single-block training step, not a full-model result.
 
+## Physical T4 validation of split-query backward (2026-11-08)
+User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2, D=64, causal:
+- Full GPU suite: **37 passed, 0 failed, 0 skipped**. The three added long-sequence gradient cases (1024-token GQA, unequal-length MQA, and 2048-token causal attention) passed against PyTorch.
+- Standalone attention forward+backward vs expanded-KV SDPA: SEQ=512 1.002 vs 0.894 ms (Triton 0.89x); SEQ=1024 1.029 vs 1.386 ms (**1.35x**); SEQ=2048 3.588 vs 4.007 ms (**1.12x**).
+- Standalone forward at SEQ=1024 and 2048: **1.70x** and **2.11x** faster than expanded-KV SDPA.
+- Synthetic decoder-block training step: SEQ=512 8.63 vs 12.40 ms (**1.44x**, but the SDPA baseline varied noticeably from the prior run); SEQ=1024 16.03 vs 16.05 ms (effectively tied); SEQ=2048 31.91 vs 31.17 ms (KOTFlash about 2.4% slower).
+- Maximum output error in the decoder-block comparison stayed below 6.1e-5. Losses and model parameters remained finite.
+- Peak incremental allocation at SEQ=2048: 42.1 MB for Triton forward+backward vs 48.4 MB for expanded-KV SDPA.
+These are user-reported single-run results for a synthetic one-block training benchmark, not a full-model guarantee. The long-sequence split path is now correctness-tested on T4; further tuning is needed to turn its attention-level gain into a consistent whole-block training speedup.
+
 ## Architecture notes
 
 - Forward uses online softmax and a tiled Q × Kᵀ / P × V loop. The full `[Sq, Sk]` attention matrix is never stored.
@@ -142,7 +152,7 @@ Standalone attention forward+backward versus expanded-KV SDPA measured 0.95x, 0.
 - Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
-- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path is newly added and still requires physical-T4 correctness and performance validation; the T4 results below validate the preceding fused backward implementation, not this new split reduction. The earlier batched PyTorch implementation remains available internally as a correctness reference.
+- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path passed the expanded physical-T4 correctness suite (37/37 tests, including 1024- and 2048-token GQA/MQA cases). Its measured T4 speed and limitations are recorded below. The earlier batched PyTorch implementation remains available internally as a correctness reference.
 - The custom kernel currently targets the upstream Triton 3.2 Turing backend. The current experimental launch defaults are BM=64, BN=32, 4 warps and 2 stages, based on the first T4 tile sweep; keep benchmarking new shapes before treating them as universal defaults.
 
 ## Roadmap
@@ -154,7 +164,8 @@ Standalone attention forward+backward versus expanded-KV SDPA measured 0.95x, 0.
 - [x] CPU/API tests and SM75 GPU test suite
 - [x] Run the Triton integration suite on a physical T4 (11/11 user-reported tests passed)
 - [x] Initial fused SM75 dQ/dK/dV backward implementation; earlier revision passed T4 tests
-- [ ] Validate and tune the new split-query dK/dV reduction path on a physical T4
+- [x] Validate split-query dK/dV reduction correctness on a physical T4 (user-reported 37/37 suite)
+- [ ] Tune long-sequence split count and partial-gradient reduction overhead on T4
 - [ ] Complete tile/warp/stage sweeps across representative T4 workloads
 - [x] Add causal future-tile skipping
 - [x] Add split-dot path for head dimensions 72/96
