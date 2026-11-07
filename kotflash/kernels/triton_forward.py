@@ -1,7 +1,8 @@
-"""Triton online-softmax attention kernel (SM75-compatible design).
+# SPDX-License-Identifier: Apache-2.0
+"""Experimental Triton online-softmax attention kernel for NVIDIA SM75.
 
-This is an experimental first-party implementation. It uses only public Triton
-APIs and does not vendor FlashAttention/CUTLASS source.
+This is a first-party implementation using public Triton APIs. It does not
+vendor or copy CUDA/Triton kernels from other attention projects.
 """
 from __future__ import annotations
 
@@ -89,7 +90,12 @@ def triton_available() -> bool:
 
 
 def triton_turing_supported() -> bool:
-    """Upstream Triton 3.2 is the last release line with Turing support."""
+    """Return whether installed upstream Triton is the Turing-capable 3.2 line.
+
+    Upstream Triton removed Volta/Turing support in 3.3. Newer versions may
+    work only when using a maintained Turing-enabled downstream build; those
+    builds are not auto-detected by this conservative check.
+    """
     if triton is None:
         return False
     try:
@@ -100,18 +106,24 @@ def triton_turing_supported() -> bool:
 
 
 def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32, block_n: int = 64):
-    """Run Triton forward. Inputs are contiguous [B, H, S, D] FP16 CUDA tensors."""
+    """Run Triton forward on contiguous [B,H,S,D] FP16 CUDA tensors."""
     if triton is None:
         raise RuntimeError("Triton is not installed. Install a Turing-compatible Triton 3.2.x build.")
     import torch
+
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("Triton backend requires CUDA tensors")
     if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
         raise TypeError("Triton backend currently supports float16 only")
+    if not (16 <= q.shape[-1] <= 128):
+        raise ValueError("Triton backend currently supports 16 <= head_dim <= 128")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("Triton kernel expects contiguous inputs")
+    if block_m <= 0 or block_n <= 0:
+        raise ValueError("block_m and block_n must be positive")
+
     b, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
-    if d > 128:
-        raise ValueError("Triton backend currently supports head_dim <= 128")
     out = q.new_empty((b, hq, sq, d))
     lse = q.new_empty((b, hq, sq), dtype=torch.float32)
     block_d = triton.next_power_of_2(d)
