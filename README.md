@@ -123,6 +123,18 @@ python benchmarks/tune_triton_tiles.py --seq 1024 --head-dim 72 --causal
 
 The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4,8}` and `num_stages={1,2}`, compares them with SDPA, and prints numerical error. Its JSON report now records every attempted, successful and failed configuration, including the compiler/resource error for failed tiles. On the first user-reported T4 sweep, `BM=64, BN=32` reached 1.118× SDPA for B=2/Hq=16/Hkv=4/SEQ=1024/D=72 causal, and 1.075× for SEQ=512/D=64 non-causal. These are individual measurements, not a general guarantee.
 
+
+## User-reported Tesla T4 benchmark matrix (2026-11-08)
+Environment: Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2, D=64, causal attention.
+
+| Sequence | Full decoder SDPA best path | KOTFlash decoder step | KOTFlash vs best SDPA |
+|---:|---:|---:|---:|
+| 256 | 5.468 ms (native GQA) | 4.631 ms | 1.18x faster |
+| 512 | 9.345 ms (expanded KV) | 8.759 ms | 1.07x faster |
+| 1024 | 16.683 ms (expanded KV) | 16.763 ms | 0.995x (effectively tied) |
+
+Standalone attention forward+backward versus expanded-KV SDPA measured 0.95x, 0.86x, 0.89x, 0.56x and 0.55x at sequence lengths 128, 256, 512, 1024 and 2048 respectively. This identifies long-sequence dK/dV backward parallelism as the next optimization target. Forward-only Triton became faster than expanded-KV SDPA at 1024 (1.34x) and 2048 (2.04x), with lower peak allocations in all tested cases. These are single-run, user-reported measurements of the previous serial dK/dV implementation; the new split-query reduction has not yet been measured on T4. The decoder benchmark is a synthetic single-block training step, not a full-model result.
+
 ## Architecture notes
 
 - Forward uses online softmax and a tiled Q × Kᵀ / P × V loop. The full `[Sq, Sk]` attention matrix is never stored.
@@ -130,7 +142,7 @@ The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4
 - Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
-- The experimental fused backward uses two Triton kernels: one computes dQ, and another computes dK/dV while reducing gradients across query-head groups. Both recompute bounded score/probability tiles and avoid materializing the full attention matrix. The earlier batched PyTorch implementation remains available internally as a correctness reference, but the Triton autograd path now uses the fused kernels. This new backward still needs physical-T4 correctness and performance validation.
+- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path is newly added and still requires physical-T4 correctness and performance validation; the T4 results below validate the preceding fused backward implementation, not this new split reduction. The earlier batched PyTorch implementation remains available internally as a correctness reference.
 - The custom kernel currently targets the upstream Triton 3.2 Turing backend. The current experimental launch defaults are BM=64, BN=32, 4 warps and 2 stages, based on the first T4 tile sweep; keep benchmarking new shapes before treating them as universal defaults.
 
 ## Roadmap
@@ -141,7 +153,8 @@ The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4
 - [x] Batched blockwise recomputation backward for validation
 - [x] CPU/API tests and SM75 GPU test suite
 - [x] Run the Triton integration suite on a physical T4 (11/11 user-reported tests passed)
-- [x] Experimental fused SM75 backward kernels (fresh T4 validation pending)
+- [x] Initial fused SM75 dQ/dK/dV backward implementation; earlier revision passed T4 tests
+- [ ] Validate and tune the new split-query dK/dV reduction path on a physical T4
 - [ ] Complete tile/warp/stage sweeps across representative T4 workloads
 - [x] Add causal future-tile skipping
 - [x] Add split-dot path for head dimensions 72/96
