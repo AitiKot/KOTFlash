@@ -62,6 +62,10 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
         and q.dtype == torch.float16
         and triton_turing_supported()
         and torch.cuda.get_device_capability(q.device) == (7, 5)
+        and torch.cuda.get_device_name(q.device) == "Tesla T4"
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
         # The timing profile was measured on this exact PyTorch/CUDA stack.
         # Other versions may choose different SDPA kernels, so keep the
         # conservative fallback until they have their own measurements.
