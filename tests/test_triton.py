@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from kotflash import attention, triton_turing_supported
+from kotflash.attention import _t4_profile_backend
 
 
 pytestmark = pytest.mark.skipif(
@@ -46,6 +47,36 @@ def test_t4_auto_profile_matches_expanded_sdpa(seq):
         is_causal=True,
     )
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
+@pytest.mark.parametrize(
+    ("seq", "expected_backend"),
+    [
+        (128, "sdpa_expanded"),
+        (256, "sdpa_expanded"),
+        (512, "sdpa_expanded"),
+        (1024, "triton"),
+        (2048, "triton"),
+    ],
+)
+def test_t4_auto_profile_selects_measured_backend(seq, expected_backend):
+    q = torch.empty(2, 8, seq, 64, device="cuda", dtype=torch.float16)
+    k = torch.empty(2, 2, seq, 64, device="cuda", dtype=torch.float16)
+    v = torch.empty_like(k)
+
+    selected = _t4_profile_backend(q, k, v, causal=True, scale=0.125)
+    assert selected == expected_backend
+
+
+def test_t4_auto_profile_rejects_unprofiled_cases():
+    q = torch.empty(2, 8, 512, 64, device="cuda", dtype=torch.float16)
+    k = torch.empty(2, 2, 512, 64, device="cuda", dtype=torch.float16)
+    v = torch.empty_like(k)
+
+    assert _t4_profile_backend(q, k, v, causal=False, scale=0.125) is None
+    assert _t4_profile_backend(q, k, v, causal=True, scale=0.1) is None
+    assert _t4_profile_backend(q[:, :, :-1], k[:, :, :-1], v[:, :, :-1],
+                               causal=True, scale=0.125) is None
 
 
 @pytest.mark.parametrize(
