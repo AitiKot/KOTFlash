@@ -159,9 +159,9 @@ def attention(
     Hq must be divisible by Hkv. The causal mask is upper-left aligned
     (key position <= query position), matching PyTorch SDPA.
 
-    backend is one of auto, triton or sdpa. The Triton forward requires
-    CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128]. Its backward
-    is a slow, blockwise PyTorch reference implementation.
+    backend is one of auto, triton or sdpa. The experimental Triton path
+    requires CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128].
+    Its fused backward is experimental and must be validated on the target GPU.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
