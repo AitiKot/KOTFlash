@@ -105,6 +105,14 @@ python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 16 --
 ```
 
 The benchmark compares four paths on the same input: native PyTorch GQA SDPA, PyTorch SDPA with K/V heads expanded, Triton and auto. The expanded-KV baseline includes the cost of repeat_interleave, so it is a fair end-to-end alternative when native GQA selects a slower backend. All backends are warmed before timing; their order is shuffled reproducibly between rounds to reduce first/last-position clock bias. The report shows per-round values, median/min/max latency, forward and forward+backward time, incremental peak allocated memory, maximum absolute error and speedup ratios against both PyTorch baselines. The numerical reference is kept outside the measured autograd path. Use at least 5 repeats (the default) and record GPU model, driver, CUDA runtime, PyTorch and Triton versions with published results. Benchmark results from other GPUs are not T4 results.
+For the exact automatic T4 profile, run the following sequence sweep (the benchmark defaults to 5 interleaved rounds):
+
+```bash
+for seq in 128 256 512 1024 2048; do
+  python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 8 --kv-heads 2 --seq "$seq" --head-dim 64 --causal --warmup 20 --iterations 50 --repeats 5
+done
+```
+
 
 To measure whether KOTFlash helps an actual training step (rather than attention in isolation), run the decoder-block benchmark:
 
@@ -155,7 +163,7 @@ User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2
 These are user-reported single-run results for a synthetic one-block training benchmark, not a full-model guarantee. The long-sequence split path is now correctness-tested on T4; further tuning is needed to turn its attention-level gain into a consistent whole-block training speedup.
 
 ## Automatic T4 backend profile
-`backend="auto"` uses a deliberately narrow profile measured on Tesla T4 / SM75 with PyTorch 2.6.0+cu124 and Triton 3.2.x: B=2, Hq=8, Hkv=2, D=64, FP16 causal self-attention at sequence lengths 128, 256, 512, 1024 and 2048. For 128–512 tokens it expands K/V and uses PyTorch SDPA; for 1024–2048 it selects the fused Triton path. Dispatch selection is covered by GPU tests. Other shapes, devices, PyTorch versions and CUDA versions retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
+`backend="auto"` uses a deliberately narrow profile measured on **Tesla T4 / SM75**, PyTorch **2.6.0+cu124** and Triton **3.2.x**. The profile only matches contiguous FP16 inputs with B=2, Hq=8, Hkv=2, D=64, causal self-attention, default scale 0.125 and Sq=Sk in {128, 256, 512, 1024, 2048}. For 128–512 tokens it expands K/V and uses PyTorch SDPA; for 1024–2048 it selects fused Triton. GPU tests assert both the selected route and numerical output. Other shapes, devices, PyTorch versions, CUDA versions and non-contiguous inputs retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
 
 ## Architecture notes
 
