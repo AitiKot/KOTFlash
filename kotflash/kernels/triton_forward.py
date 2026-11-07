@@ -88,6 +88,17 @@ def triton_available() -> bool:
     return triton is not None
 
 
+def triton_turing_supported() -> bool:
+    """Upstream Triton 3.2 is the last release line with Turing support."""
+    if triton is None:
+        return False
+    try:
+        parts = tuple(int(piece) for piece in triton.__version__.split("+")[0].split(".")[:2])
+    except (AttributeError, ValueError):
+        return False
+    return parts == (3, 2)
+
+
 def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32, block_n: int = 64):
     """Run Triton forward. Inputs are contiguous [B, H, S, D] FP16 CUDA tensors."""
     if triton is None:
