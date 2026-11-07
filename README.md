@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). The custom path has passed user-run correctness tests on a Tesla T4 and has shown gains for selected attention and synthetic decoder-block shapes. It remains experimental: performance varies by sequence length, and full-model training speedup has not been established.
 
-> **Status: alpha / latest user-run Tesla T4 validation: 42/42 tests passed on PyTorch 2.6.0+cu124 and Triton 3.2.0.** Six additional tests now assert the exact `auto` routing and fallback guards; these new tests still need a fresh physical-T4 run (48 tests expected).
+> **Status: alpha / latest user-run Tesla T4 validation: 48/48 tests passed on PyTorch 2.6.0+cu124 and Triton 3.2.0.** The current branch also has a five-round interleaved attention benchmark on the same T4 stack. Performance claims are limited to the profiled workload.
 
 ## What works today
 
@@ -16,7 +16,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | User-reported Tesla T4 run: 42/42 passed on the prior revision; six new route/fallback checks await rerun (48 expected) |
+| Physical T4 validation | User-reported Tesla T4 run: **48/48 passed**, including auto-route/fallback checks and long split-query backward |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
@@ -132,24 +132,30 @@ python benchmarks/tune_triton_tiles.py --seq 1024 --head-dim 72 --causal
 The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4,8}` and `num_stages={1,2}`, compares them with SDPA, and prints numerical error. Its JSON report now records every attempted, successful and failed configuration, including the compiler/resource error for failed tiles. On the first user-reported T4 sweep, `BM=64, BN=32` reached 1.118× SDPA for B=2/Hq=16/Hkv=4/SEQ=1024/D=72 causal, and 1.075× for SEQ=512/D=64 non-causal. These are individual measurements, not a general guarantee.
 
 
-## User-reported Tesla T4 benchmark matrix (2026-11-08)
-Environment: Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2, D=64, causal attention.
+## Current physical T4 validation and benchmark (2026-11-08)
+User-run Colab validation on Tesla T4 / SM75, PyTorch 2.6.0+cu124, CUDA 12.4 and Triton 3.2.0. Workload: B=2, Hq=8, Hkv=2, D=64, FP16 causal self-attention.
 
-| Sequence | Full decoder SDPA best path | KOTFlash decoder step | KOTFlash vs best SDPA |
-|---:|---:|---:|---:|
-| 256 | 5.468 ms (native GQA) | 4.631 ms | 1.18x faster |
-| 512 | 9.345 ms (expanded KV) | 8.759 ms | 1.07x faster |
-| 1024 | 16.683 ms (expanded KV) | 16.763 ms | 0.995x (effectively tied) |
+- Full current-branch suite: **48 passed, 0 failed, 0 skipped** in 3.85 seconds.
+- The five profiled sequence lengths passed numerical comparison against expanded-KV SDPA.
+- Route tests confirmed expanded-KV SDPA at sequence lengths 128/256/512 and fused Triton at 1024/2048.
+- Long split-query backward cases passed: 1024-token causal GQA, unequal-length MQA (Sk=768), and 2048-token causal GQA.
 
-Standalone attention forward+backward versus expanded-KV SDPA measured 0.95x, 0.86x, 0.89x, 0.56x and 0.55x at sequence lengths 128, 256, 512, 1024 and 2048 respectively. This identifies long-sequence dK/dV backward parallelism as the next optimization target. Forward-only Triton became faster than expanded-KV SDPA at 1024 (1.34x) and 2048 (2.04x), with lower peak allocations in all tested cases. These are single-run, user-reported measurements of the previous serial dK/dV implementation; the new split-query reduction has not yet been measured on T4. The decoder benchmark is a synthetic single-block training step, not a full-model result.
+The updated benchmark warmed all paths first, randomized backend order reproducibly over five rounds, and reported medians. Each round used 50 forward timing iterations and 12 forward+backward iterations.
 
-## Latest physical T4 validation (2026-11-08)
-A user-run Colab validation on Tesla T4 / SM75, PyTorch 2.6.0+cu124 and Triton 3.2.0 completed:
-- Full suite on the preceding branch revision: **42 passed, 0 failed, 0 skipped**.
-- The five auto-profile lengths passed numerical comparison against expanded-KV SDPA, and long split-query backward cases passed for 1024-token causal GQA, unequal-length MQA and 2048-token causal GQA.
-- The current branch adds six direct route/fallback assertions (five sequence choices plus one unprofiled-input test). These exact new tests still require a fresh physical-T4 run; the expected collection count is 48.
+| Sequence | Expanded SDPA F+B | Triton F+B | Auto F+B | Auto vs expanded SDPA |
+|---:|---:|---:|---:|---:|
+| 128 | 0.865 ms | 1.014 ms | 0.914 ms | 0.947x |
+| 256 | 0.973 ms | 0.978 ms | 0.911 ms | 1.067x |
+| 512 | 0.884 ms | 0.959 ms | 0.899 ms | 0.983x |
+| 1024 | 1.314 ms | 1.113 ms | 1.212 ms | **1.084x** |
+| 2048 | 4.056 ms | 3.886 ms | 3.842 ms | **1.056x** |
 
-The benchmark has since been changed to warm all backends before timing and shuffle backend order reproducibly across five rounds. The earlier sequential timings showed a discrepancy between direct Triton and auto even though both selected the same Triton path; those numbers are not considered a stable performance result. Re-run the interleaved benchmark on a physical T4 before publishing fresh speedup claims. This validation establishes correctness and dispatch, not full-model training speedup.
+Interpretation:
+- At 128–512, auto selects expanded-KV SDPA. Results are close to the baseline (within about 7% in this run); treat these as parity, not a meaningful performance gain.
+- At 1024 and 2048, auto selects Triton and measured 8.4% and 5.6% lower forward+backward attention latency than expanded-KV SDPA.
+- Direct Triton measured 1.18x and 1.04x versus expanded SDPA at 1024 and 2048, respectively. The 1024 direct-Triton and auto results differ by about 0.10 ms despite using the same kernel path; this highlights remaining timing/dispatch variability. The results are medians from one five-round sweep, not a broad statistical study.
+
+These are **standalone attention** measurements, not a full decoder block or full language-model training result. Earlier synthetic decoder-block measurements were near parity at 1024 and about 2.4% slower at 2048. Do not extrapolate the attention-only gains to end-to-end model tokens/second.
 
 ## Physical T4 validation of split-query backward (2026-11-08)
 User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2, D=64, causal:
