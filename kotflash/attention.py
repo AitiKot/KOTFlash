@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -51,26 +52,39 @@ def _sdpa_expanded(q, k, v, *, causal: bool, scale: Optional[float]):
     return F.scaled_dot_product_attention(q, k, v, **kwargs)
 
 
+@lru_cache(maxsize=8)
+def _is_measured_t4_runtime(device_index: int) -> bool:
+    """Cache immutable device/runtime checks outside the attention hot path."""
+    device = torch.device("cuda", device_index)
+    return (
+        torch.cuda.is_available()
+        and triton_turing_supported()
+        and torch.cuda.get_device_capability(device) == (7, 5)
+        and torch.cuda.get_device_name(device) == "Tesla T4"
+        # The timing profile was measured on this exact PyTorch/CUDA stack.
+        # Other versions may choose different SDPA kernels.
+        and torch.__version__.split("+", 1)[0] == "2.6.0"
+        and torch.version.cuda == "12.4"
+    )
+
+
 def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
     """Return a backend only for the exact T4 profile measured so far.
 
-    Profile: B=2, Hq=8, Hkv=2, D=64, causal self-attention,
-    FP16, and sequence lengths measured on Tesla T4 / SM75.
+    Profile: contiguous B=2, Hq=8, Hkv=2, D=64 FP16 causal self-attention
+    at measured sequence lengths on Tesla T4 / SM75.
     """
+    if not q.is_cuda or q.dtype != torch.float16:
+        return None
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if not _is_measured_t4_runtime(device_index):
+        return None
     if not (
-        q.is_cuda
-        and q.dtype == torch.float16
-        and triton_turing_supported()
-        and torch.cuda.get_device_capability(q.device) == (7, 5)
-        and torch.cuda.get_device_name(q.device) == "Tesla T4"
-        and q.is_contiguous()
+        q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
-        # The timing profile was measured on this exact PyTorch/CUDA stack.
-        # Other versions may choose different SDPA kernels, so keep the
-        # conservative fallback until they have their own measurements.
-        and torch.__version__.split("+", 1)[0] == "2.6.0"
-        and torch.version.cuda == "12.4"
         and causal
         and q.shape == (2, 8, q.shape[2], 64)
         and k.shape == (2, 2, q.shape[2], 64)
@@ -80,7 +94,7 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
     ):
         return None
     # Measured on T4: expanded SDPA is faster through 512 tokens;
-    # fused Triton attention forward+backward wins at 1024 and 2048.
+    # fused Triton attention forward+backward is the candidate at 1024+.
     return "triton" if q.shape[2] >= 1024 else "sdpa_expanded"
 
 
