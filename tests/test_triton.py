@@ -37,6 +37,9 @@ def test_triton_forward_matches_sdpa(head_dim, causal):
         (4, 4, 64, 80, 32, False),  # MHA, non-causal
         (8, 2, 64, 80, 64, True),   # GQA, causal
         (8, 1, 80, 64, 32, True),   # MQA, causal, Q longer than K
+        (8, 2, 48, 64, 72, False),  # GQA, split head dimension
+        (4, 4, 48, 64, 96, True),   # MHA, split head dimension
+        (8, 1, 64, 48, 128, False), # MQA, largest supported head dimension
     ],
 )
 def test_triton_backward_matches_sdpa(
