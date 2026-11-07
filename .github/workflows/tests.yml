@@ -16,4 +16,5 @@ jobs:
       - run: python -m pip install -e .
       - run: python -m compileall -q kotflash benchmarks tests
       - run: pytest -q
+      - run: python benchmarks/benchmark_attention.py --device cpu --batch 1 --q-heads 2 --kv-heads 1 --seq 16 --head-dim 8 --warmup 1 --iterations 2 --repeats 3
       - run: python -m build
