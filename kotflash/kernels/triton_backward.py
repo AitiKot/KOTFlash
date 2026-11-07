@@ -206,10 +206,13 @@ if triton is not None:
         Q_TILES_PER_SPLIT: tl.constexpr,
     ):
         """Long-sequence path: parallel query chunks write independent partials."""
-        pid_split = tl.program_id(0)
-        pid_n = tl.program_id(1)
-        pid_b = tl.program_id(2)
-        pid_kh = tl.program_id(3)
+        # Triton launch grids support at most three dimensions.
+        # Flatten (split, KV tile) into axis 0 and decode it here.
+        num_n_tiles = tl.cdiv(Sk, BN)
+        pid_split = tl.program_id(0) // num_n_tiles
+        pid_n = tl.program_id(0) % num_n_tiles
+        pid_b = tl.program_id(1)
+        pid_kh = tl.program_id(2)
 
         offs_n = pid_n * BN + tl.arange(0, BN)
         offs_m = tl.arange(0, BM)
@@ -383,7 +386,7 @@ def attention_backward(
         dv_part = torch.empty_like(dk_part)
 
         _attention_bwd_dkv_split[
-            (num_splits, triton.cdiv(sk, block_n), bsz, hkv)
+            (num_splits * triton.cdiv(sk, block_n), bsz, hkv)
         ](
             q, k, v, out, lse, grad_out, dk_part, dv_part,
             bsz, sq, sk, hq, hkv, d, scale, causal,
