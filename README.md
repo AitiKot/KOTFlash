@@ -145,6 +145,9 @@ User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2
 - Peak incremental allocation at SEQ=2048: 42.1 MB for Triton forward+backward vs 48.4 MB for expanded-KV SDPA.
 These are user-reported single-run results for a synthetic one-block training benchmark, not a full-model guarantee. The long-sequence split path is now correctness-tested on T4; further tuning is needed to turn its attention-level gain into a consistent whole-block training speedup.
 
+## Automatic T4 backend profile
+`backend="auto"` uses a deliberately narrow measured profile: B=2, Hq=8, Hkv=2, D=64, FP16 causal self-attention on SM75/Triton 3.2.x at sequence lengths 128, 256, 512, 1024 and 2048. For 128–512 tokens it expands K/V and uses PyTorch SDPA; for 1024–2048 it selects the fused Triton path. Other shapes and devices retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available.
+
 ## Architecture notes
 
 - Forward uses online softmax and a tiled Q × Kᵀ / P × V loop. The full `[Sq, Sk]` attention matrix is never stored.
