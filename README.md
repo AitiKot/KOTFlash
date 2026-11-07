@@ -112,7 +112,7 @@ To measure whether KOTFlash helps an actual training step (rather than attention
 python benchmarks/benchmark_decoder_block.py --batch 2 --seq 512 --q-heads 8 --kv-heads 2 --head-dim 64
 ```
 
-It includes Q/K/V/output projections, attention, an MLP, forward, backward and an AdamW update. The report includes median step time, tokens/second, incremental peak memory and output error versus SDPA. This is a small decoder-block test, not a full language-model training result; use your own model and sequence lengths for the final decision.
+It includes Q/K/V/output projections, attention, an MLP, forward, backward and an AdamW update. Model parameters and surrounding block operations remain FP32; Q/K/V are cast to FP16 for both attention implementations, avoiding direct FP16 AdamW master weights. The report compares KOTFlash with both native PyTorch GQA SDPA and SDPA with KV heads expanded (which can select a faster T4 backend). It includes median step time, tokens/second, incremental peak memory, output error and finite-loss/parameter checks. This is a small decoder-block test, not a full language-model training result; use your own model and sequence lengths for the final decision.
 
 
 For a T4-specific forward tile sweep, run:
