@@ -10,6 +10,7 @@ import statistics
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import triton
 
 from kotflash.kernels.triton_forward import (
