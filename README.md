@@ -177,7 +177,7 @@ These are user-reported single-run results for a synthetic one-block training be
 - Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
-- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path passed the expanded physical-T4 correctness suite (37/37 tests, including 1024- and 2048-token GQA/MQA cases). Its measured T4 speed and limitations are recorded below. The earlier batched PyTorch implementation remains available internally as a correctness reference.
+- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path passed the expanded physical-T4 correctness suite; the current complete branch suite is 48/48 tests, including 1024- and 2048-token GQA/MQA cases. Its measured T4 speed and limitations are recorded above. The earlier batched PyTorch implementation remains available internally as a correctness reference.
 - The custom kernel currently targets the upstream Triton 3.2 Turing backend. The current experimental launch defaults are BM=64, BN=32, 4 warps and 2 stages, based on the first T4 tile sweep; keep benchmarking new shapes before treating them as universal defaults.
 
 ## Roadmap
@@ -189,7 +189,7 @@ These are user-reported single-run results for a synthetic one-block training be
 - [x] CPU/API tests and SM75 GPU test suite
 - [x] Run the Triton integration suite on a physical T4 (11/11 user-reported tests passed)
 - [x] Initial fused SM75 dQ/dK/dV backward implementation; earlier revision passed T4 tests
-- [x] Validate split-query dK/dV reduction correctness on a physical T4 (user-reported 37/37 suite)
+- [x] Validate split-query dK/dV reduction correctness on a physical T4 (included in the user-reported 48/48 current suite)
 - [ ] Tune long-sequence split count and partial-gradient reduction overhead on T4
 - [ ] Complete tile/warp/stage sweeps across representative T4 workloads
 - [x] Add causal future-tile skipping
