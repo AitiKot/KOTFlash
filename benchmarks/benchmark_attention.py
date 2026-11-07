@@ -71,7 +71,23 @@ def main():
 
     ref_out = reference()
     ref_ms, ref_mem = timed(reference, args.warmup, args.iterations, device)
-    report["pytorch_sdpa"] = {"forward_ms": ref_ms, "peak_allocated_bytes": ref_mem}
+
+    def reference_train_step():
+        q.grad = None
+        k.grad = None
+        v.grad = None
+        y = reference()
+        y.float().square().mean().backward()
+
+    ref_train_ms, ref_train_mem = timed(
+        reference_train_step, max(2, args.warmup // 4), max(5, args.iterations // 4), device
+    )
+    report["pytorch_sdpa"] = {
+        "forward_ms": ref_ms,
+        "forward_peak_allocated_bytes": ref_mem,
+        "forward_backward_ms": ref_train_ms,
+        "forward_backward_peak_allocated_bytes": ref_train_mem,
+    }
 
     for backend in ("triton", "auto"):
         try:
