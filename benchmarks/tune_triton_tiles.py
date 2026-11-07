@@ -147,7 +147,7 @@ def main():
         "successful_config_count": len(results),
         "all_configs": results,
     }
-    print("\\n" + json.dumps(report, indent=2, default=str))
+    print("\n" + json.dumps(report, indent=2, default=str))
 
 
 if __name__ == "__main__":
