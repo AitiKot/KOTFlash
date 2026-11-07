@@ -2,7 +2,7 @@
 
 **Experimental memory-efficient attention for NVIDIA Turing (SM75), exposed through a general PyTorch API.**
 
-KOTFlash is an independent, research-stage implementation. The first public milestone contains a PyTorch SDPA fallback and an experimental Triton online-softmax forward kernel. Backward currently recomputes blocks in ordinary PyTorch operations: it is intended for correctness experiments, not production-speed training.
+KOTFlash is an independent, research-stage implementation. The first public milestone contains a PyTorch SDPA fallback and an experimental Triton online-softmax forward kernel. Backward recomputes attention blocks with batched PyTorch operations. This is usable for correctness checks and experimental training, but it is not a fused GPU backward kernel and has not been shown to speed up full-model training.
 
 > **Status: alpha / user-reported Tesla T4 validation: 11/11 Triton integration tests passed. Initial tile profiling found limited forward wins on tested shapes; no general speedup is claimed.** Run the correctness suite and benchmarks on your hardware before using it for training.
 
@@ -15,8 +15,8 @@ KOTFlash is an independent, research-stage implementation. The first public mile
 | Triton online-softmax forward | Experimental; FP16, SM75, Triton 3.2.x, head_dim 16–128 |
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
-| Backward | Blockwise PyTorch recomputation; correctness-first and slow |
-| Physical T4 validation | User-reported 11/11 tests passed on Tesla T4; performance profiling ongoing |
+| Backward | Memory-bounded, batched PyTorch recomputation; correct reference path, still slower than a fused GPU backward |
+| Physical T4 validation | An earlier user-run test revision passed 11/11 tests on Tesla T4; expanded backward tests for the current revision still need a fresh T4 run |
 | Fused SM75 backward | Not implemented |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
@@ -112,7 +112,7 @@ For a T4-specific forward tile sweep, run:
 python benchmarks/tune_triton_tiles.py --seq 1024 --head-dim 72 --causal
 ```
 
-The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4,8}` and `num_stages={1,2}`, compares them with SDPA, and prints numerical error. Resource-limit failures are reported and skipped. On the first user-reported T4 sweep, `BM=64, BN=32` reached 1.118× SDPA for B=2/Hq=16/Hkv=4/SEQ=1024/D=72 causal, and 1.075× for SEQ=512/D=64 non-causal. These are individual measurements, not a general guarantee.
+The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4,8}` and `num_stages={1,2}`, compares them with SDPA, and prints numerical error. Its JSON report now records every attempted, successful and failed configuration, including the compiler/resource error for failed tiles. On the first user-reported T4 sweep, `BM=64, BN=32` reached 1.118× SDPA for B=2/Hq=16/Hkv=4/SEQ=1024/D=72 causal, and 1.075× for SEQ=512/D=64 non-causal. These are individual measurements, not a general guarantee.
 
 ## Architecture notes
 
@@ -121,7 +121,7 @@ The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4
 - Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
-- The reference backward recomputes score/probability tiles and serially accumulates shared dK/dV in Python. This avoids a full attention matrix, but is expected to be slow. It is not a fused CUDA/Triton backward kernel.
+- The reference backward recomputes score/probability tiles in bounded blocks. It batches the batch/head dimensions together and reduces grouped-query dK/dV gradients back to shared KV heads. This avoids a full attention matrix and removes per-head Python loops, but it remains a PyTorch reference implementation, not a fused CUDA/Triton backward kernel.
 - The custom kernel currently targets the upstream Triton 3.2 Turing backend. The current experimental launch defaults are BM=64, BN=32, 4 warps and 2 stages, based on the first T4 tile sweep; keep benchmarking new shapes before treating them as universal defaults.
 
 ## Roadmap
@@ -129,7 +129,7 @@ The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4
 - [x] Public PyTorch API and SDPA fallback
 - [x] Experimental tiled online-softmax forward
 - [x] MHA/GQA/MQA indexing
-- [x] Blockwise recomputation backward for validation
+- [x] Batched blockwise recomputation backward for validation
 - [x] CPU/API tests and SM75 GPU test suite
 - [x] Run the Triton integration suite on a physical T4 (11/11 user-reported tests passed)
 - [ ] Fused SM75 backward kernels
