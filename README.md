@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). The custom path has passed user-run correctness tests on a Tesla T4 and has shown gains for selected attention and synthetic decoder-block shapes. It remains experimental: performance varies by sequence length, and full-model training speedup has not been established.
 
-> **Status: alpha / user-reported Tesla T4 validation: 37/37 tests passed on PyTorch 2.6.0+cu124 and Triton 3.2.0, including long-sequence split-backward cases.** Run the correctness suite and benchmarks on your own hardware before using it for training.
+> **Status: alpha / user-reported Tesla T4 validation: 42/42 tests passed on PyTorch 2.6.0+cu124 and Triton 3.2.0, including exact `auto` routing and long-sequence split-backward cases.** The physical GPU suite is user-run; run it again on your own hardware before using KOTFlash for training.
 
 ## What works today
 
@@ -16,7 +16,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | User-reported Tesla T4 run: 37/37 tests passed, including long split-query gradient cases |
+| Physical T4 validation | User-reported Tesla T4 run: 42/42 tests passed, including five `auto` profile lengths and long split-query gradients |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
@@ -87,7 +87,7 @@ attention(q, k, v, *, causal=False, scale=None, backend='auto')
 - `scale=None` uses `1 / sqrt(D)`
 - `backend`: `auto`, `triton` or `sdpa`
 
-The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. `auto` currently uses SDPA conservatively because the initial T4 measurements do not establish a consistent Triton win; select `backend='triton'` to benchmark the custom kernel.
+The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. `auto` uses a narrow T4 profile only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes; every other shape or software stack falls back to PyTorch SDPA.
 
 ## Tests and benchmark
 
@@ -104,7 +104,7 @@ pytest -q tests/test_triton.py
 python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 16 --kv-heads 4 --seq 1024 --head-dim 72 --causal
 ```
 
-The benchmark compares four paths on the same input: native PyTorch GQA SDPA, PyTorch SDPA with K/V heads expanded, Triton and auto. The expanded-KV baseline includes the cost of repeat_interleave, so it is a fair end-to-end alternative when native GQA selects a slower backend. CUDA timings use GPU events and report median latency, forward and forward+backward time, incremental peak allocated memory, maximum absolute error and speedup ratios against both PyTorch baselines. The numerical reference is kept outside the measured autograd path. Record the GPU model, driver, CUDA runtime, PyTorch and Triton versions with any published result. Benchmark results from other GPUs are not T4 results.
+The benchmark compares four paths on the same input: native PyTorch GQA SDPA, PyTorch SDPA with K/V heads expanded, Triton and auto. The expanded-KV baseline includes the cost of repeat_interleave, so it is a fair end-to-end alternative when native GQA selects a slower backend. All backends are warmed before timing; their order is shuffled reproducibly between rounds to reduce first/last-position clock bias. The report shows per-round values, median/min/max latency, forward and forward+backward time, incremental peak allocated memory, maximum absolute error and speedup ratios against both PyTorch baselines. The numerical reference is kept outside the measured autograd path. Use at least 5 repeats (the default) and record GPU model, driver, CUDA runtime, PyTorch and Triton versions with published results. Benchmark results from other GPUs are not T4 results.
 
 To measure whether KOTFlash helps an actual training step (rather than attention in isolation), run the decoder-block benchmark:
 
@@ -135,6 +135,15 @@ Environment: Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=
 
 Standalone attention forward+backward versus expanded-KV SDPA measured 0.95x, 0.86x, 0.89x, 0.56x and 0.55x at sequence lengths 128, 256, 512, 1024 and 2048 respectively. This identifies long-sequence dK/dV backward parallelism as the next optimization target. Forward-only Triton became faster than expanded-KV SDPA at 1024 (1.34x) and 2048 (2.04x), with lower peak allocations in all tested cases. These are single-run, user-reported measurements of the previous serial dK/dV implementation; the new split-query reduction has not yet been measured on T4. The decoder benchmark is a synthetic single-block training step, not a full-model result.
 
+## Latest physical T4 validation (2026-11-08)
+A user-run Colab validation on Tesla T4 / SM75, PyTorch 2.6.0+cu124 and Triton 3.2.0 completed:
+- Full suite: **42 passed, 0 failed, 0 skipped**.
+- The five auto-profile lengths (128, 256, 512, 1024 and 2048) passed numerical comparison against expanded-KV SDPA.
+- Explicit routing assertions confirmed expanded-SDPA dispatch for lengths 128–512 and Triton dispatch for 1024–2048.
+- Long split-query backward cases passed for 1024-token causal GQA, unequal-length MQA and 2048-token causal GQA.
+
+The benchmark has since been changed to warm all backends before timing and shuffle backend order reproducibly across five rounds. The earlier sequential timings showed a discrepancy between direct Triton and auto even though both selected the same Triton path; those numbers are not considered a stable performance result. Re-run the interleaved benchmark on a physical T4 before publishing fresh speedup claims. This validation establishes correctness and dispatch, not full-model training speedup.
+
 ## Physical T4 validation of split-query backward (2026-11-08)
 User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2, D=64, causal:
 - Full GPU suite: **37 passed, 0 failed, 0 skipped**. The three added long-sequence gradient cases (1024-token GQA, unequal-length MQA, and 2048-token causal attention) passed against PyTorch.
@@ -146,7 +155,7 @@ User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2
 These are user-reported single-run results for a synthetic one-block training benchmark, not a full-model guarantee. The long-sequence split path is now correctness-tested on T4; further tuning is needed to turn its attention-level gain into a consistent whole-block training speedup.
 
 ## Automatic T4 backend profile
-`backend="auto"` uses a deliberately narrow measured profile: B=2, Hq=8, Hkv=2, D=64, FP16 causal self-attention on SM75/Triton 3.2.x at sequence lengths 128, 256, 512, 1024 and 2048. For 128–512 tokens it expands K/V and uses PyTorch SDPA; for 1024–2048 it selects the fused Triton path. Other shapes and devices retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available.
+`backend="auto"` uses a deliberately narrow profile measured on Tesla T4 / SM75 with PyTorch 2.6.0+cu124 and Triton 3.2.x: B=2, Hq=8, Hkv=2, D=64, FP16 causal self-attention at sequence lengths 128, 256, 512, 1024 and 2048. For 128–512 tokens it expands K/V and uses PyTorch SDPA; for 1024–2048 it selects the fused Triton path. Dispatch selection is covered by GPU tests. Other shapes, devices, PyTorch versions and CUDA versions retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
 
 ## Architecture notes
 
