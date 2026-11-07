@@ -91,7 +91,7 @@ if triton is not None:
 
     @triton.jit
     def _attention_bwd_dkv(
-        Q, K, V, LSE, DO, DK, DV,
+        Q, K, V, O, LSE, DO, DK, DV,
         Sq: tl.constexpr, Sk: tl.constexpr,
         Hq: tl.constexpr, Hkv: tl.constexpr,
         D: tl.constexpr, SCALE: tl.constexpr,
@@ -139,6 +139,7 @@ if triton is not None:
 
                 q_ptrs = Q + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
                 do_ptrs = DO + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
+                o_ptrs = O + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
                 lse_ptrs = LSE + (pid_b * Hq + q_head) * Sq + query_pos
 
                 q = tl.load(
@@ -148,6 +149,11 @@ if triton is not None:
                 )
                 do = tl.load(
                     do_ptrs,
+                    mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
+                    other=0,
+                )
+                o = tl.load(
+                    o_ptrs,
                     mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
                     other=0,
                 )
@@ -168,14 +174,9 @@ if triton is not None:
 
                 dp = tl.dot(do, tl.trans(v))
                 delta = tl.sum(
-                    # O is not needed here: delta = sum(P * dP), but using
-                    # sum(O * dO) requires O. Reconstruct O from P @ V below.
-                    tl.zeros((BM, BD), tl.float32), axis=1
+                    o.to(tl.float32) * do.to(tl.float32), axis=1
                 )
-                # The softmax Jacobian correction is delta_i = O_i dot dO_i.
-                # Reconstruct O_i from the probabilities and this K tile is
-                # insufficient, so this kernel receives O in the next version.
-                ds = p * dp
+                ds = p * (dp - delta[:, None])
 
                 dk_acc += tl.dot(tl.trans(ds.to(q.dtype)), q) * SCALE
                 dv_acc += tl.dot(tl.trans(p.to(do.dtype)), do)
@@ -234,7 +235,7 @@ def attention_backward(
         num_stages=num_stages,
     )
     _attention_bwd_dkv[(triton.cdiv(sk, block_n), bsz, hkv)](
-        q, k, v, lse, grad_out, dk, dv,
+        q, k, v, out, lse, grad_out, dk, dv,
         sq, sk, hq, hkv, d, scale, causal,
         block_m, block_n, bd, group,
         num_warps=num_warps,
