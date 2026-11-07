@@ -78,6 +78,12 @@ def test_t4_auto_profile_rejects_unprofiled_cases():
     assert _t4_profile_backend(q[:, :, :-1], k[:, :, :-1], v[:, :, :-1],
                                causal=True, scale=0.125) is None
 
+    # Non-contiguous tensors were not part of the measured profile.
+    q_nc = torch.empty(2, 8, 512, 128, device="cuda", dtype=torch.float16)[..., ::2]
+    k_nc = torch.empty(2, 2, 512, 128, device="cuda", dtype=torch.float16)[..., ::2]
+    v_nc = torch.empty_like(k_nc)
+    assert _t4_profile_backend(q_nc, k_nc, v_nc, causal=True, scale=0.125) is None
+
 
 @pytest.mark.parametrize(
     ("hq", "hkv", "sq", "sk", "head_dim", "causal"),
