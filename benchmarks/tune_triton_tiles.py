@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Find a good Triton tile size for the current CUDA device and attention shape."""
+"""Sweep T4 Triton attention tile and launch parameters for one shape."""
 from __future__ import annotations
 
 import argparse
 import json
-import statistics
 import math
+import statistics
 
 import torch
 import torch.nn.functional as F
@@ -62,6 +62,8 @@ def main():
         parser.error("CUDA is required")
     if torch.cuda.get_device_capability() != (7, 5):
         parser.error("This tuner is intended for NVIDIA T4 / SM75")
+    if args.batch <= 0 or args.q_heads <= 0 or args.kv_heads <= 0:
+        parser.error("batch and head counts must be positive")
     if args.q_heads % args.kv_heads:
         parser.error("--q-heads must be divisible by --kv-heads")
     if args.seq <= 0 or args.head_dim < 16 or args.head_dim > 128:
@@ -87,31 +89,48 @@ def main():
 
     scale = 1.0 / math.sqrt(args.head_dim)
     results = []
-    for block_m in (16, 32, 64):
+    # These dimensions are intentionally bounded: all candidates are tested
+    # on the real SM75 device, and resource failures are recorded, not fatal.
+    for block_m in (32, 64):
         for block_n in (32, 64, 128):
-            try:
-                fn = lambda: attention_forward(
-                    q, k, v, causal=args.causal, scale=scale,
-                    block_m=block_m, block_n=block_n
-                )[0]
-                output = fn()
-                torch.cuda.synchronize()
-                error = (output.float() - reference.float()).abs().max().item()
-                elapsed = median_cuda_ms(fn, args.warmup, args.iterations)
-                results.append({
-                    "BM": block_m,
-                    "BN": block_n,
-                    "median_ms": elapsed,
-                    "speedup_vs_sdpa": sdpa_ms / elapsed,
-                    "max_abs_error": error,
-                })
-                print(
-                    f"BM={block_m:2d} BN={block_n:3d} | "
-                    f"{elapsed:.4f} ms | {sdpa_ms / elapsed:.3f}x | "
-                    f"error={error:.6g}"
-                )
-            except Exception as exc:
-                print(f"BM={block_m} BN={block_n} FAILED: {type(exc).__name__}: {exc}")
+            for num_warps in (4, 8):
+                for num_stages in (1, 2):
+                    label = (
+                        f"BM={block_m:2d} BN={block_n:3d} "
+                        f"warps={num_warps} stages={num_stages}"
+                    )
+                    try:
+                        def fn():
+                            return attention_forward(
+                                q, k, v, causal=args.causal, scale=scale,
+                                block_m=block_m, block_n=block_n,
+                                num_warps=num_warps, num_stages=num_stages,
+                            )[0]
+
+                        output = fn()
+                        torch.cuda.synchronize()
+                        error = (output.float() - reference.float()).abs().max().item()
+                        elapsed = median_cuda_ms(fn, args.warmup, args.iterations)
+                        row = {
+                            "BM": block_m,
+                            "BN": block_n,
+                            "num_warps": num_warps,
+                            "num_stages": num_stages,
+                            "median_ms": elapsed,
+                            "speedup_vs_sdpa": sdpa_ms / elapsed,
+                            "max_abs_error": error,
+                        }
+                        results.append(row)
+                        print(
+                            f"{label} | {elapsed:.4f} ms | "
+                            f"{sdpa_ms / elapsed:.3f}x | error={error:.6g}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"{label} FAILED: {type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
 
     results.sort(key=lambda row: row["median_ms"])
     report = {
@@ -124,10 +143,11 @@ def main():
         },
         "causal": args.causal,
         "sdpa_median_ms": sdpa_ms,
-        "best_configs": results[:5],
+        "best_configs": results[:8],
+        "successful_config_count": len(results),
         "all_configs": results,
     }
-    print("\n" + json.dumps(report, indent=2, default=str))
+    print("\\n" + json.dumps(report, indent=2, default=str))
 
 
 if __name__ == "__main__":
