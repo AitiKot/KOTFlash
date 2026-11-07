@@ -222,76 +222,79 @@ if triton is not None:
         if CAUSAL:
             # Query tiles entirely before this key tile contribute exactly zero.
             q_tile_start = tl.maximum(q_tile_start, (pid_n * BN) // BM)
-            if pid_n * BN >= q_tile_end * BM:
-                return
-        if q_tile_start >= q_tile_end:
-            return
-
-        k_ptrs = K + ((pid_b * Hkv + pid_kh) * Sk + offs_n[:, None]) * D + offs_d[None, :]
-        v_ptrs = V + ((pid_b * Hkv + pid_kh) * Sk + offs_n[:, None]) * D + offs_d[None, :]
-        k = tl.load(
-            k_ptrs,
-            mask=(offs_n[:, None] < Sk) & (offs_d[None, :] < D),
-            other=0,
-        )
-        v = tl.load(
-            v_ptrs,
-            mask=(offs_n[:, None] < Sk) & (offs_d[None, :] < D),
-            other=0,
-        )
+            do_work = (
+                (q_tile_start < q_tile_end)
+                & (pid_n * BN < q_tile_end * BM)
+            )
+        else:
+            do_work = q_tile_start < q_tile_end
 
         dk_acc = tl.zeros((BN, BD), tl.float32)
         dv_acc = tl.zeros((BN, BD), tl.float32)
 
-        for group_idx in tl.static_range(GROUP):
-            q_head = pid_kh * GROUP + group_idx
+        if do_work:
+            k_ptrs = K + ((pid_b * Hkv + pid_kh) * Sk + offs_n[:, None]) * D + offs_d[None, :]
+            v_ptrs = V + ((pid_b * Hkv + pid_kh) * Sk + offs_n[:, None]) * D + offs_d[None, :]
+            k = tl.load(
+                k_ptrs,
+                mask=(offs_n[:, None] < Sk) & (offs_d[None, :] < D),
+                other=0,
+            )
+            v = tl.load(
+                v_ptrs,
+                mask=(offs_n[:, None] < Sk) & (offs_d[None, :] < D),
+                other=0,
+            )
 
-            for start_m in range(q_tile_start, q_tile_end):
-                query_pos = start_m * BM + offs_m
+            for group_idx in tl.static_range(GROUP):
+                q_head = pid_kh * GROUP + group_idx
 
-                q_ptrs = Q + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
-                do_ptrs = DO + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
-                o_ptrs = O + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
-                lse_ptrs = LSE + (pid_b * Hq + q_head) * Sq + query_pos
+                for start_m in range(q_tile_start, q_tile_end):
+                    query_pos = start_m * BM + offs_m
 
-                q = tl.load(
-                    q_ptrs,
-                    mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
-                    other=0,
-                )
-                do = tl.load(
-                    do_ptrs,
-                    mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
-                    other=0,
-                )
-                o = tl.load(
-                    o_ptrs,
-                    mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
-                    other=0,
-                )
-                lse = tl.load(
-                    lse_ptrs,
-                    mask=query_pos < Sq,
-                    other=0,
-                ).to(tl.float32)
+                    q_ptrs = Q + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
+                    do_ptrs = DO + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
+                    o_ptrs = O + ((pid_b * Hq + q_head) * Sq + query_pos[:, None]) * D + offs_d[None, :]
+                    lse_ptrs = LSE + (pid_b * Hq + q_head) * Sq + query_pos
 
-                scores = tl.dot(q, tl.trans(k)) * SCALE
-                valid = (query_pos[:, None] < Sq) & (offs_n[None, :] < Sk)
-                if CAUSAL:
-                    valid = valid & (offs_n[None, :] <= query_pos[:, None])
-                scores = tl.where(valid, scores, float("-inf"))
+                    q = tl.load(
+                        q_ptrs,
+                        mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
+                        other=0,
+                    )
+                    do = tl.load(
+                        do_ptrs,
+                        mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
+                        other=0,
+                    )
+                    o = tl.load(
+                        o_ptrs,
+                        mask=(query_pos[:, None] < Sq) & (offs_d[None, :] < D),
+                        other=0,
+                    )
+                    lse = tl.load(
+                        lse_ptrs,
+                        mask=query_pos < Sq,
+                        other=0,
+                    ).to(tl.float32)
 
-                p = tl.exp(scores - lse[:, None])
-                p = tl.where(valid, p, 0.0)
+                    scores = tl.dot(q, tl.trans(k)) * SCALE
+                    valid = (query_pos[:, None] < Sq) & (offs_n[None, :] < Sk)
+                    if CAUSAL:
+                        valid = valid & (offs_n[None, :] <= query_pos[:, None])
+                    scores = tl.where(valid, scores, float("-inf"))
 
-                dp = tl.dot(do, tl.trans(v))
-                delta = tl.sum(
-                    o.to(tl.float32) * do.to(tl.float32), axis=1
-                )
-                ds = p * (dp - delta[:, None])
+                    p = tl.exp(scores - lse[:, None])
+                    p = tl.where(valid, p, 0.0)
 
-                dk_acc += tl.dot(tl.trans(ds.to(q.dtype)), q) * SCALE
-                dv_acc += tl.dot(tl.trans(p.to(do.dtype)), do)
+                    dp = tl.dot(do, tl.trans(v))
+                    delta = tl.sum(
+                        o.to(tl.float32) * do.to(tl.float32), axis=1
+                    )
+                    ds = p * (dp - delta[:, None])
+
+                    dk_acc += tl.dot(tl.trans(ds.to(q.dtype)), q) * SCALE
+                    dv_acc += tl.dot(tl.trans(p.to(do.dtype)), do)
 
         partial_base = (
             ((pid_split * BATCH + pid_b) * Hkv + pid_kh) * Sk * D
@@ -302,7 +305,6 @@ if triton is not None:
         mask = (offs_n[:, None] < Sk) & (offs_d[None, :] < D)
         tl.store(DK_PART + partial_offsets, dk_acc, mask=mask)
         tl.store(DV_PART + partial_offsets, dv_acc, mask=mask)
-
 
     @triton.jit
     def _attention_bwd_dkv_reduce(
