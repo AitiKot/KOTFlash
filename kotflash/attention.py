@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .kernels.triton_forward import attention_forward, triton_available
+from .kernels.triton_forward import attention_forward, triton_turing_supported
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -133,12 +133,12 @@ def attention(
 
     capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)
     can_triton = (
-        q.is_cuda and q.dtype == torch.float16 and triton_available()
+        q.is_cuda and q.dtype == torch.float16 and triton_turing_supported()
         and q.shape[-1] <= 128
         and capability == (7, 5)
     )
     if backend == "triton" and not can_triton:
-        raise RuntimeError("Triton backend requires a Turing-compatible Triton build, CUDA SM75, FP16 and head_dim <= 128")
+        raise RuntimeError("Triton backend requires upstream Triton 3.2.x (or a compatible Turing-enabled build), CUDA SM75, FP16 and head_dim <= 128")
     if backend == "triton" or (backend == "auto" and can_triton):
         return _TritonAttention.apply(q, k, v, causal, float(scale))
     return _sdpa(q, k, v, causal=causal, scale=scale)
