@@ -31,23 +31,46 @@ def test_triton_forward_matches_sdpa(head_dim, causal):
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
 
 
-def test_triton_backward_matches_sdpa_gqa():
+@pytest.mark.parametrize(
+    ("hq", "hkv", "sq", "sk", "head_dim", "causal"),
+    [
+        (4, 4, 64, 80, 32, False),  # MHA, non-causal
+        (8, 2, 64, 80, 64, True),   # GQA, causal
+        (8, 1, 80, 64, 32, True),   # MQA, causal, Q longer than K
+    ],
+)
+def test_triton_backward_matches_sdpa(
+    hq, hkv, sq, sk, head_dim, causal
+):
     torch.manual_seed(12)
-    q = torch.randn(1, 8, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
-    k = torch.randn(1, 2, 80, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+    q = torch.randn(
+        1, hq, sq, head_dim, device="cuda", dtype=torch.float16,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        1, hkv, sk, head_dim, device="cuda", dtype=torch.float16,
+        requires_grad=True,
+    )
     v = torch.randn_like(k, requires_grad=True)
-    grad_seed = torch.randn(1, 8, 64, 64, device="cuda", dtype=torch.float16)
+    grad_seed = torch.randn(
+        1, hq, sq, head_dim, device="cuda", dtype=torch.float16,
+    )
 
-    out = attention(q, k, v, causal=True, backend="triton")
+    out = attention(q, k, v, causal=causal, backend="triton")
     actual_grads = torch.autograd.grad(out, (q, k, v), grad_seed)
 
     q_ref = q.detach().clone().requires_grad_(True)
     k_ref = k.detach().clone().requires_grad_(True)
     v_ref = v.detach().clone().requires_grad_(True)
+    groups = hq // hkv
     out_ref = F.scaled_dot_product_attention(
-        q_ref, k_ref.repeat_interleave(4, dim=1),
-        v_ref.repeat_interleave(4, dim=1), is_causal=True,
+        q_ref,
+        k_ref.repeat_interleave(groups, dim=1),
+        v_ref.repeat_interleave(groups, dim=1),
+        is_causal=causal,
     )
-    expected_grads = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_seed)
+    expected_grads = torch.autograd.grad(
+        out_ref, (q_ref, k_ref, v_ref), grad_seed
+    )
     for actual, expected in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1e-2)
