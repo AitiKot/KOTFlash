@@ -20,6 +20,7 @@ classifiers = [
 
 [project.optional-dependencies]
 triton = ["triton>=3.2,<3.3"]
+t4 = ["triton>=3.2,<3.3"]
 test = ["pytest>=7", "pytest-cov"]
 
 [tool.setuptools.packages.find]
