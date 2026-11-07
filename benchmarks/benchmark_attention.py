@@ -131,7 +131,9 @@ def main():
         "auto": auto_fn,
     }
 
-    expanded_reference = sdpa_expanded_kv()
+    # Keep the numerical reference out of the measured autograd/memory path.
+    with torch.no_grad():
+        expanded_reference = sdpa_expanded_kv()
     sync(device)
 
     report = {
@@ -166,11 +168,13 @@ def main():
     results = {}
     for name, fn in backends.items():
         try:
-            output = fn()
+            with torch.no_grad():
+                output = fn()
             sync(device)
             output_error = (
                 output.float() - expanded_reference.float()
             ).abs().max().item()
+            del output
 
             def train_step():
                 q.grad = None
