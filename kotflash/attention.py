@@ -62,11 +62,13 @@ def _blockwise_backward(
     q, k, v, out, lse, grad_out, *, causal: bool, scale: float,
     q_block: int = 32, kv_block: int = 64,
 ):
-    """Memory-bounded reference backward; recomputes score tiles instead of storing SxS.
+    """Memory-bounded reference backward using batched PyTorch matrix operations.
 
-    This is intentionally a correctness-oriented PyTorch implementation, not a
-    fused high-performance backward kernel. Its Python loops make it slow for
-    long sequences; use it for validation until a native SM75 backward lands.
+    Score/probability tiles are recomputed instead of storing the full SxS
+    attention matrix. Batch and head dimensions are processed together, and
+    grouped KV gradients are reduced back to their shared KV heads. This is
+    substantially less Python-loop overhead than a per-head implementation,
+    but it is still a reference backward, not a fused high-performance kernel.
     """
     bsz, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
@@ -78,35 +80,48 @@ def _blockwise_backward(
     dk = torch.zeros_like(kf)
     dv = torch.zeros_like(vf)
 
-    for b in range(bsz):
-        for h in range(hq):
-            kh = h // group
-            for qs in range(0, sq, q_block):
-                qe = min(qs + q_block, sq)
-                qb = qf[b, h, qs:qe]
-                dob = dof[b, h, qs:qe]
-                lseb = lsef[b, h, qs:qe]
-                delta = (of[b, h, qs:qe] * dob).sum(dim=-1)
-                dq_block = torch.zeros_like(qb)
-                qpos = torch.arange(qs, qe, device=q.device)
-                for ks in range(0, sk, kv_block):
-                    ke = min(ks + kv_block, sk)
-                    kb = kf[b, kh, ks:ke]
-                    vb = vf[b, kh, ks:ke]
-                    scores = torch.matmul(qb, kb.transpose(0, 1)) * scale
-                    kpos = torch.arange(ks, ke, device=q.device)
-                    if causal:
-                        scores = scores.masked_fill(kpos[None, :] > qpos[:, None], float("-inf"))
-                    p = torch.exp(scores - lseb[:, None])
-                    p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
-                    dp = torch.matmul(dob, vb.transpose(0, 1))
-                    ds = p * (dp - delta[:, None])
-                    dq_block.add_(torch.matmul(ds, kb) * scale)
-                    dk[b, kh, ks:ke].add_(torch.matmul(ds.transpose(0, 1), qb) * scale)
-                    dv[b, kh, ks:ke].add_(torch.matmul(p.transpose(0, 1), dob))
-                dq[b, h, qs:qe] = dq_block
-    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
+    for qs in range(0, sq, q_block):
+        qe = min(qs + q_block, sq)
+        qb = qf[:, :, qs:qe, :]
+        dob = dof[:, :, qs:qe, :]
+        lseb = lsef[:, :, qs:qe]
+        delta = (of[:, :, qs:qe, :] * dob).sum(dim=-1)
+        dq_block = torch.zeros_like(qb)
+        qpos = torch.arange(qs, qe, device=q.device)
 
+        for ks in range(0, sk, kv_block):
+            ke = min(ks + kv_block, sk)
+            # Expand only the current KV tile, not the complete KV sequence.
+            kb = kf[:, :, ks:ke, :].repeat_interleave(group, dim=1)
+            vb = vf[:, :, ks:ke, :].repeat_interleave(group, dim=1)
+            scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+            kpos = torch.arange(ks, ke, device=q.device)
+            if causal:
+                scores = scores.masked_fill(
+                    kpos[None, None, None, :] > qpos[None, None, :, None],
+                    float("-inf"),
+                )
+
+            p = torch.exp(scores - lseb[:, :, :, None])
+            p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+            dp = torch.matmul(dob, vb.transpose(-2, -1))
+            ds = p * (dp - delta[:, :, :, None])
+
+            dq_block.add_(torch.matmul(ds, kb) * scale)
+            dk_group = torch.matmul(ds.transpose(-2, -1), qb)
+            dv_group = torch.matmul(p.transpose(-2, -1), dob)
+
+            # Query heads are laid out as contiguous groups for each KV head.
+            dk[:, :, ks:ke, :].add_(
+                dk_group.reshape(bsz, hkv, group, ke - ks, d).sum(dim=2) * scale
+            )
+            dv[:, :, ks:ke, :].add_(
+                dv_group.reshape(bsz, hkv, group, ke - ks, d).sum(dim=2)
+            )
+
+        dq[:, :, qs:qe, :] = dq_block
+
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 class _TritonAttention(torch.autograd.Function):
     @staticmethod
