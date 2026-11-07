@@ -60,7 +60,7 @@ def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
 
 def _blockwise_backward(
     q, k, v, out, lse, grad_out, *, causal: bool, scale: float,
-    q_block: int = 32, kv_block: int = 64,
+    q_block: int = 64, kv_block: int = 128,
 ):
     """Memory-bounded reference backward using batched PyTorch matrix operations.
 
