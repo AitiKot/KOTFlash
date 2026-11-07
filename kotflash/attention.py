@@ -162,19 +162,23 @@ def attention(
     if backend not in {"auto", "triton", "sdpa"}:
         raise ValueError("backend must be one of: auto, triton, sdpa")
 
-    capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)
-    can_triton = (
-        q.is_cuda
-        and q.dtype == torch.float16
-        and triton_turing_supported()
-        and 16 <= q.shape[-1] <= 128
-        and capability == (7, 5)
-    )
-    if backend == "triton" and not can_triton:
-        raise RuntimeError(
-            "Triton backend requires Triton 3.2.x (or a compatible Turing-enabled build), "
-            "CUDA SM75, FP16 and 16 <= head_dim <= 128"
+    if backend == "triton":
+        capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)
+        can_triton = (
+            q.is_cuda
+            and q.dtype == torch.float16
+            and triton_turing_supported()
+            and 16 <= q.shape[-1] <= 128
+            and capability == (7, 5)
         )
-    if backend == "triton" or (backend == "auto" and can_triton):
+        if not can_triton:
+            raise RuntimeError(
+                "Triton backend requires Triton 3.2.x (or a compatible Turing-enabled build), "
+                "CUDA SM75, FP16 and 16 <= head_dim <= 128"
+            )
         return _TritonAttention.apply(q, k, v, causal, float(scale))
+
+    # Current T4 measurements show SDPA ahead for most tested shapes. Keep
+    # auto on the established PyTorch backend until Triton demonstrates a
+    # repeatable win on representative workloads.
     return _sdpa(q, k, v, causal=causal, scale=scale)
