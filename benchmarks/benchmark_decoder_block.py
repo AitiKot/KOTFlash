@@ -181,6 +181,7 @@ def main():
         "iterations": args.iterations,
     }
 
+    triton_available = True
     try:
         with torch.no_grad():
             reference = sdpa_model(x, "sdpa")
@@ -190,18 +191,16 @@ def main():
                 candidate.float() - reference.float()
             ).abs().max().item()
     except Exception as exc:
+        triton_available = False
         report["triton"] = {
             "unavailable_or_failed": f"{type(exc).__name__}: {exc}"
         }
-        del sdpa_model, triton_model, template
-        torch.cuda.empty_cache()
-        print(json.dumps(report, indent=2, default=str))
-        return
 
     del sdpa_model, triton_model, template
     torch.cuda.empty_cache()
 
-    for backend in ("sdpa", "triton"):
+    backends = ("sdpa", "triton") if triton_available else ("sdpa",)
+    for backend in backends:
         try:
             report[backend] = benchmark_backend(
                 backend, initial_state, x, target, args
