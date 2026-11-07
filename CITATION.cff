@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use KOTFlash in research, please cite the repository and include the exact version or commit."
+title: "KOTFlash: Experimental memory-efficient attention for NVIDIA Turing GPUs"
+type: software
+repository-code: "https://github.com/AitiKot/KOTFlash"
+license: Apache-2.0
+year: 2026
+version: 0.1.0
+authors:
+  - name: "KOTFlash contributors"
