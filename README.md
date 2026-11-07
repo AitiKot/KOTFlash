@@ -15,9 +15,9 @@ KOTFlash is an independent, research-stage implementation. The first public mile
 | Triton online-softmax forward | Experimental; FP16, SM75, Triton 3.2.x, head_dim 16–128 |
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
-| Backward | Memory-bounded, batched PyTorch recomputation; correct reference path, still slower than a fused GPU backward |
+| Backward | Experimental fused Triton dQ and dK/dV kernels with block recomputation; requires fresh T4 validation |
 | Physical T4 validation | An earlier user-run test revision passed 11/11 tests on Tesla T4; expanded backward tests for the current revision still need a fresh T4 run |
-| Fused SM75 backward | Not implemented |
+| Fused SM75 backward | Implemented experimentally; physical-T4 validation pending |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
 
@@ -130,7 +130,7 @@ The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4
 - Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
-- The reference backward recomputes score/probability tiles in bounded blocks. It batches the batch/head dimensions together and reduces grouped-query dK/dV gradients back to shared KV heads. This avoids a full attention matrix and removes per-head Python loops, but it remains a PyTorch reference implementation, not a fused CUDA/Triton backward kernel.
+- The experimental fused backward uses two Triton kernels: one computes dQ, and another computes dK/dV while reducing gradients across query-head groups. Both recompute bounded score/probability tiles and avoid materializing the full attention matrix. The earlier batched PyTorch implementation remains available internally as a correctness reference, but the Triton autograd path now uses the fused kernels. This new backward still needs physical-T4 correctness and performance validation.
 - The custom kernel currently targets the upstream Triton 3.2 Turing backend. The current experimental launch defaults are BM=64, BN=32, 4 warps and 2 stages, based on the first T4 tile sweep; keep benchmarking new shapes before treating them as universal defaults.
 
 ## Roadmap
@@ -141,7 +141,7 @@ The tuner measures combinations of `BM={32,64}`, `BN={32,64,128}`, `num_warps={4
 - [x] Batched blockwise recomputation backward for validation
 - [x] CPU/API tests and SM75 GPU test suite
 - [x] Run the Triton integration suite on a physical T4 (11/11 user-reported tests passed)
-- [ ] Fused SM75 backward kernels
+- [x] Experimental fused SM75 backward kernels (fresh T4 validation pending)
 - [ ] Complete tile/warp/stage sweeps across representative T4 workloads
 - [x] Add causal future-tile skipping
 - [x] Add split-dot path for head dimensions 72/96
