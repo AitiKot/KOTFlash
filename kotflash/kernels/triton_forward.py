@@ -23,6 +23,7 @@ if triton is not None:
         D: tl.constexpr, SCALE: tl.constexpr,
         CAUSAL: tl.constexpr,
         BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+        DTAIL: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_b = tl.program_id(1)
@@ -31,35 +32,87 @@ if triton is not None:
 
         offs_m = pid_m * BM + tl.arange(0, BM)
         offs_n = tl.arange(0, BN)
-        offs_d = tl.arange(0, BD)
-
         q_base = ((pid_b * Hq + pid_h) * Sq + offs_m[:, None]) * D
-        q = tl.load(
-            Q + q_base + offs_d[None, :],
-            mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
-            other=0.0,
-        )
+
+        # Split D=72/96 into 64 + tail instead of padding the full dot to 128.
+        if D > 64 and D < 128:
+            offs_d0 = tl.arange(0, 64)
+            offs_dt = tl.arange(0, DTAIL)
+            q0 = tl.load(
+                Q + q_base + offs_d0[None, :],
+                mask=(offs_m[:, None] < Sq) & (offs_d0[None, :] < D),
+                other=0.0,
+            )
+            qt = tl.load(
+                Q + q_base + 64 + offs_dt[None, :],
+                mask=(offs_m[:, None] < Sq) & (64 + offs_dt[None, :] < D),
+                other=0.0,
+            )
+            acc0 = tl.zeros((BM, 64), tl.float32)
+            acct = tl.zeros((BM, DTAIL), tl.float32)
+        else:
+            offs_d = tl.arange(0, BD)
+            q = tl.load(
+                Q + q_base + offs_d[None, :],
+                mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
+                other=0.0,
+            )
+            acc = tl.zeros((BM, BD), tl.float32)
 
         m_i = tl.full((BM,), float("-inf"), tl.float32)
         l_i = tl.zeros((BM,), tl.float32)
-        acc = tl.zeros((BM, BD), tl.float32)
 
-        for start_n in range(tl.cdiv(Sk, BN)):
+        # Skip full future K/V tiles for causal attention. Clamp to Sq as well
+        # as Sk to preserve upper-left causal semantics for unequal lengths.
+        if CAUSAL:
+            max_key_exclusive = tl.minimum(
+                tl.minimum(Sk, Sq),
+                (pid_m + 1) * BM,
+            )
+            end_n = tl.cdiv(max_key_exclusive, BN)
+        else:
+            end_n = tl.cdiv(Sk, BN)
+
+        for start_n in range(end_n):
             block_n = start_n * BN + offs_n
             k_base = ((pid_b * Hkv + kv_h) * Sk + block_n[None, :]) * D
-            k = tl.load(
-                K + k_base + offs_d[:, None],
-                mask=(block_n[None, :] < Sk) & (offs_d[:, None] < D),
-                other=0.0,
-            )
             v_base = ((pid_b * Hkv + kv_h) * Sk + block_n[:, None]) * D
-            v = tl.load(
-                V + v_base + offs_d[None, :],
-                mask=(block_n[:, None] < Sk) & (offs_d[None, :] < D),
-                other=0.0,
-            )
 
-            scores = tl.dot(q, k) * SCALE
+            if D > 64 and D < 128:
+                k0 = tl.load(
+                    K + k_base + offs_d0[:, None],
+                    mask=(block_n[None, :] < Sk) & (offs_d0[:, None] < D),
+                    other=0.0,
+                )
+                kt = tl.load(
+                    K + k_base + 64 + offs_dt[:, None],
+                    mask=(block_n[None, :] < Sk) & (64 + offs_dt[:, None] < D),
+                    other=0.0,
+                )
+                v0 = tl.load(
+                    V + v_base + offs_d0[None, :],
+                    mask=(block_n[:, None] < Sk) & (offs_d0[None, :] < D),
+                    other=0.0,
+                )
+                vt = tl.load(
+                    V + v_base + 64 + offs_dt[None, :],
+                    mask=(block_n[:, None] < Sk) & (64 + offs_dt[None, :] < D),
+                    other=0.0,
+                )
+                scores = (tl.dot(q0, k0) + tl.dot(qt, kt)) * SCALE
+            else:
+                k = tl.load(
+                    K + k_base + offs_d[:, None],
+                    mask=(block_n[None, :] < Sk) & (offs_d[:, None] < D),
+                    other=0.0,
+                )
+                v = tl.load(
+                    V + v_base + offs_d[None, :],
+                    mask=(block_n[:, None] < Sk) & (offs_d[None, :] < D),
+                    other=0.0,
+                )
+                scores = tl.dot(q, k) * SCALE
+
             valid = (offs_m[:, None] < Sq) & (block_n[None, :] < Sk)
             if CAUSAL:
                 valid = valid & (block_n[None, :] <= offs_m[:, None])
@@ -71,18 +124,43 @@ if triton is not None:
             p = tl.exp(scores - m_new[:, None])
             p = tl.where(valid, p, 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+
+            if D > 64 and D < 128:
+                p_cast = p.to(v0.dtype)
+                acc0 = acc0 * alpha[:, None] + tl.dot(p_cast, v0)
+                acct = acct * alpha[:, None] + tl.dot(p_cast, vt)
+            else:
+                acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+
             m_i = m_new
 
-        out = acc / l_i[:, None]
-        o_base = ((pid_b * Hq + pid_h) * Sq + offs_m[:, None]) * D
-        tl.store(
-            O + o_base + offs_d[None, :],
-            out,
-            mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
-        )
+        if D > 64 and D < 128:
+            out0 = acc0 / l_i[:, None]
+            outt = acct / l_i[:, None]
+            tl.store(
+                O + q_base + offs_d0[None, :],
+                out0,
+                mask=(offs_m[:, None] < Sq) & (offs_d0[None, :] < D),
+            )
+            tl.store(
+                O + q_base + 64 + offs_dt[None, :],
+                outt,
+                mask=(offs_m[:, None] < Sq) & (64 + offs_dt[None, :] < D),
+            )
+        else:
+            out = acc / l_i[:, None]
+            tl.store(
+                O + q_base + offs_d[None, :],
+                out,
+                mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
+            )
+
         lse = m_i + tl.log(l_i)
-        tl.store(LSE + (pid_b * Hq + pid_h) * Sq + offs_m, lse, mask=offs_m < Sq)
+        tl.store(
+            LSE + (pid_b * Hq + pid_h) * Sq + offs_m,
+            lse,
+            mask=offs_m < Sq,
+        )
 
 
 def triton_available() -> bool:
@@ -127,10 +205,11 @@ def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32,
     out = q.new_empty((b, hq, sq, d))
     lse = q.new_empty((b, hq, sq), dtype=torch.float32)
     block_d = triton.next_power_of_2(d)
+    tail_d = max(16, triton.next_power_of_2(max(1, d - 64)))
     _attention_fwd_kernel[(triton.cdiv(sq, block_m), b, hq)](
         q, k, v, out, lse,
         sq, sk, hq, hkv, d, scale, causal,
-        block_m, block_n, block_d,
+        block_m, block_n, block_d, tail_d,
         num_warps=4,
         num_stages=2,
     )
