@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation. The first public milestone contains a PyTorch SDPA fallback and an experimental Triton online-softmax forward kernel. Backward currently recomputes blocks in ordinary PyTorch operations: it is intended for correctness experiments, not production-speed training.
 
-> **Status: alpha / not yet validated on a physical T4 in the maintainer's environment. No speedup is promised.** Run the correctness suite and benchmarks on your hardware before using it for training.
+> **Status: alpha / initial physical Tesla T4 forward benchmark completed; full GPU test-suite validation is still pending. No general speedup is claimed.** Run the correctness suite and benchmarks on your hardware before using it for training.
 
 ## What works today
 
@@ -14,9 +14,9 @@ KOTFlash is an independent, research-stage implementation. The first public mile
 | MHA / GQA / MQA API | Implemented |
 | Triton online-softmax forward | Experimental; FP16, SM75, Triton 3.2.x, head_dim 16–128 |
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
-| Head dimension 72 | Accepted; padded internally to 128, not yet a tuned specialization |
+| Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Blockwise PyTorch recomputation; correctness-first and slow |
-| Physical T4 validation | Not yet completed by the maintainer |
+| Physical T4 validation | Initial user-reported forward benchmark; full pytest integration run pending |
 | Fused SM75 backward | Not implemented |
 | Packed variable-length sequences | Not implemented |
 | Dropout, local window, KV cache | Not implemented |
@@ -59,9 +59,11 @@ q = torch.randn(2, 16, 1024, 72, device='cuda', dtype=torch.float16, requires_gr
 k = torch.randn(2, 4, 1024, 72, device='cuda', dtype=torch.float16, requires_grad=True)
 v = torch.randn_like(k, requires_grad=True)
 
-# auto selects the experimental Triton path only on supported SM75 inputs;
-# otherwise it uses PyTorch SDPA.
+# Conservative default: use the installed PyTorch SDPA backend.
 y = attention(q, k, v, causal=True, backend='auto')
+
+# Explicitly opt in to the experimental SM75 Triton kernel.
+y_triton = attention(q, k, v, causal=True, backend='triton')
 y.float().square().mean().backward()
 ```
 
@@ -85,7 +87,7 @@ attention(q, k, v, *, causal=False, scale=None, backend='auto')
 - `scale=None` uses `1 / sqrt(D)`
 - `backend`: `auto`, `triton` or `sdpa`
 
-The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. The `auto` backend falls back to SDPA on unsupported devices, dtypes or dimensions.
+The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. `auto` currently uses SDPA conservatively because the initial T4 measurements do not establish a consistent Triton win; select `backend='triton'` to benchmark the custom kernel.
 
 ## Tests and benchmark
 
@@ -107,6 +109,8 @@ The benchmark compares SDPA, Triton and auto on the same input shape. It reports
 ## Architecture notes
 
 - Forward uses online softmax and a tiled Q × Kᵀ / P × V loop. The full `[Sq, Sk]` attention matrix is never stored.
+- Causal forward skips complete future K/V tiles instead of loading and masking them.
+- Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
 - The reference backward recomputes score/probability tiles and serially accumulates shared dK/dV in Python. This avoids a full attention matrix, but is expected to be slow. It is not a fused CUDA/Triton backward kernel.
@@ -122,7 +126,9 @@ The benchmark compares SDPA, Triton and auto on the same input shape. It reports
 - [ ] Run the full test suite on a physical T4 and publish raw logs
 - [ ] Fused SM75 backward kernels
 - [ ] Tune tile sizes, warps and stages on T4
-- [ ] Optimize head dimension 72 without padding to 128
+- [x] Add causal future-tile skipping
+- [x] Add split-dot path for head dimensions 72/96
+- [ ] Profile and tune the split-dot path on T4
 - [ ] Variable-length packed sequences
 - [ ] Dropout, local-window attention and KV-cache variants
 - [ ] More PyTorch / Triton compatibility checks
