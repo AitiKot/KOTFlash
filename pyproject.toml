@@ -1,19 +1,19 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kotflash"
-version = "0.1.0"
-description = "Experimental memory-efficient attention kernels optimized for NVIDIA Turing GPUs"
+version = "0.1.1"
+description = "Experimental memory-efficient attention kernels for NVIDIA Turing GPUs"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
-authors = [{ name = "KOTFlash Contributors" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "AitiKot" }]
 keywords = ["attention", "flash-attention", "cuda", "turing", "t4", "pytorch", "triton"]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -21,7 +21,7 @@ classifiers = [
 [project.optional-dependencies]
 triton = ["triton>=3.2,<3.3"]
 t4 = ["triton>=3.2,<3.3"]
-test = ["pytest>=7", "pytest-cov"]
+test = ["pytest>=7"]
 
 [tool.setuptools.packages.find]
 include = ["kotflash*"]
