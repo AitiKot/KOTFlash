@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare SDPA and KOTFlash inside a complete decoder-block training step.
+"""Compare PyTorch SDPA and KOTFlash in a complete decoder-block training step.
 
-Run after installing KOTFlash in a CUDA environment:
-    python benchmarks/benchmark_decoder_block.py --batch 2 --seq 1024 --q-heads 16 --kv-heads 4 --head-dim 64
+The model keeps FP32 master parameters while attention inputs are FP16. This
+matches the usual mixed-precision training pattern and avoids applying AdamW
+directly to FP16 parameters (where its default epsilon can underflow).
+
+Run on a T4:
+    python benchmarks/benchmark_decoder_block.py --batch 2 --seq 512 --q-heads 8 --kv-heads 2 --head-dim 64
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 
 import torch
@@ -54,8 +59,33 @@ class TinyDecoderBlock(nn.Module):
             batch, seq, self.kv_heads, self.head_dim
         ).transpose(1, 2)
 
-        attended = attention(q, k, v, causal=True, backend=backend)
-        attended = attended.transpose(1, 2).contiguous().view(batch, seq, hidden)
+        # Keep FP32 master weights/activations; use FP16 only in attention.
+        q_attn = q.to(torch.float16)
+        k_attn = k.to(torch.float16)
+        v_attn = v.to(torch.float16)
+
+        if backend == "triton":
+            attended = attention(
+                q_attn, k_attn, v_attn, causal=True, backend="triton"
+            )
+        elif backend == "sdpa_native_gqa":
+            attended = attention(
+                q_attn, k_attn, v_attn, causal=True, backend="sdpa"
+            )
+        elif backend == "sdpa_expanded_kv":
+            groups = self.q_heads // self.kv_heads
+            attended = F.scaled_dot_product_attention(
+                q_attn,
+                k_attn.repeat_interleave(groups, dim=1),
+                v_attn.repeat_interleave(groups, dim=1),
+                is_causal=True,
+            )
+        else:
+            raise ValueError(f"Unknown attention backend: {backend}")
+
+        attended = attended.transpose(1, 2).contiguous().view(
+            batch, seq, hidden
+        ).to(dtype=normalized.dtype)
         x = x + self.o_proj(attended)
 
         normalized = self.norm2(x)
@@ -66,7 +96,7 @@ class TinyDecoderBlock(nn.Module):
 def train_step(model, optimizer, x, target, backend: str):
     optimizer.zero_grad(set_to_none=True)
     prediction = model(x, backend)
-    loss = F.mse_loss(prediction.float(), target.float())
+    loss = F.mse_loss(prediction, target)
     loss.backward()
     optimizer.step()
     return loss.detach()
@@ -81,11 +111,11 @@ def benchmark_backend(
 ):
     model = TinyDecoderBlock(
         args.q_heads, args.kv_heads, args.head_dim
-    ).to(device=x.device, dtype=x.dtype)
+    ).to(device=x.device, dtype=torch.float32)
     model.load_state_dict(initial_state)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    # Warm up kernels and lazy optimizer state before measuring memory/time.
+    # Warm up kernels and lazy optimizer state before measuring.
     for _ in range(args.warmup):
         train_step(model, optimizer, x, target, backend)
     torch.cuda.synchronize()
@@ -108,12 +138,19 @@ def benchmark_backend(
     peak_extra = max(
         0, torch.cuda.max_memory_allocated(x.device) - baseline_memory
     )
+    parameters_finite = all(
+        torch.isfinite(parameter).all().item()
+        for parameter in model.parameters()
+    )
+    loss_value = float(last_loss.item())
     tokens_per_step = x.shape[0] * x.shape[1]
     return {
         "median_step_ms": median_ms,
         "tokens_per_second": tokens_per_step * 1000.0 / median_ms,
         "incremental_peak_allocated_bytes": peak_extra,
-        "last_loss": float(last_loss.item()),
+        "last_loss": loss_value,
+        "loss_finite": math.isfinite(loss_value),
+        "parameters_finite_after_update": parameters_finite,
     }
 
 
@@ -141,27 +178,29 @@ def main():
 
     torch.manual_seed(1234)
     device = torch.device("cuda")
-    dtype = torch.float16
+    # FP32 master parameters + FP32 surrounding block; attention casts Q/K/V
+    # to FP16 for both SDPA and KOTFlash so the comparison uses equal precision.
+    model_dtype = torch.float32
+    attention_dtype = torch.float16
     hidden = args.q_heads * args.head_dim
-    x = torch.randn(args.batch, args.seq, hidden, device=device, dtype=dtype)
+    x = torch.randn(
+        args.batch, args.seq, hidden, device=device, dtype=model_dtype
+    )
     target = torch.randn_like(x)
 
-    template = TinyDecoderBlock(
-        args.q_heads, args.kv_heads, args.head_dim
-    )
+    template = TinyDecoderBlock(args.q_heads, args.kv_heads, args.head_dim)
     initial_state = {
         key: value.detach().clone()
         for key, value in template.state_dict().items()
     }
 
-    # Compare the two implementations before any optimizer updates.
     sdpa_model = TinyDecoderBlock(
         args.q_heads, args.kv_heads, args.head_dim
-    ).to(device=device, dtype=dtype)
+    ).to(device=device, dtype=model_dtype)
     sdpa_model.load_state_dict(initial_state)
     triton_model = TinyDecoderBlock(
         args.q_heads, args.kv_heads, args.head_dim
-    ).to(device=device, dtype=dtype)
+    ).to(device=device, dtype=model_dtype)
     triton_model.load_state_dict(initial_state)
 
     report = {
@@ -176,7 +215,9 @@ def main():
             "head_dim": args.head_dim,
             "hidden_size": hidden,
         },
-        "dtype": str(dtype),
+        "model_parameter_dtype": str(model_dtype),
+        "attention_compute_dtype": str(attention_dtype),
+        "optimizer": "AdamW with FP32 master parameters",
         "warmup": args.warmup,
         "iterations": args.iterations,
     }
@@ -184,22 +225,33 @@ def main():
     triton_available = True
     try:
         with torch.no_grad():
-            reference = sdpa_model(x, "sdpa")
+            reference = sdpa_model(x, "sdpa_expanded_kv")
             candidate = triton_model(x, "triton")
             torch.cuda.synchronize()
-            report["max_abs_output_error_vs_sdpa"] = (
+            report["max_abs_output_error_vs_expanded_sdpa"] = (
                 candidate.float() - reference.float()
             ).abs().max().item()
+            report["triton_output_finite"] = bool(
+                torch.isfinite(candidate).all().item()
+            )
     except Exception as exc:
         triton_available = False
-        report["triton"] = {
+        report["triton_forward"] = {
             "unavailable_or_failed": f"{type(exc).__name__}: {exc}"
         }
 
     del sdpa_model, triton_model, template
     torch.cuda.empty_cache()
 
-    backends = ("sdpa", "triton") if triton_available else ("sdpa",)
+    backends = (
+        "sdpa_expanded_kv",
+        "sdpa_native_gqa",
+        "triton",
+    ) if triton_available else (
+        "sdpa_expanded_kv",
+        "sdpa_native_gqa",
+    )
+
     for backend in backends:
         try:
             report[backend] = benchmark_backend(
@@ -211,10 +263,13 @@ def main():
             }
         torch.cuda.empty_cache()
 
-    sdpa_ms = report.get("sdpa", {}).get("median_step_ms")
     triton_ms = report.get("triton", {}).get("median_step_ms")
-    if sdpa_ms and triton_ms:
-        report["training_step_speedup_vs_sdpa"] = sdpa_ms / triton_ms
+    for baseline in ("sdpa_expanded_kv", "sdpa_native_gqa"):
+        baseline_ms = report.get(baseline, {}).get("median_step_ms")
+        if baseline_ms and triton_ms:
+            report[f"training_step_speedup_vs_{baseline}"] = (
+                baseline_ms / triton_ms
+            )
 
     print(json.dumps(report, indent=2, default=str))
 
