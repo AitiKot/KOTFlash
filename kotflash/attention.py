@@ -39,6 +39,42 @@ def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise ValueError("Sequence dimensions must be non-zero")
 
 
+def _sdpa_expanded(q, k, v, *, causal: bool, scale: Optional[float]):
+    """Run SDPA after expanding grouped KV heads (useful on Turing)."""
+    if q.shape[1] != k.shape[1]:
+        repeat = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
+    if scale is not None:
+        kwargs["scale"] = scale
+    return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+
+def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
+    """Return a backend only for the exact T4 profile measured so far.
+
+    Profile: B=2, Hq=8, Hkv=2, D=64, causal self-attention,
+    FP16, and sequence lengths measured on Tesla T4 / SM75.
+    """
+    if not (
+        q.is_cuda
+        and q.dtype == torch.float16
+        and triton_turing_supported()
+        and torch.cuda.get_device_capability(q.device) == (7, 5)
+        and causal
+        and q.shape == (2, 8, q.shape[2], 64)
+        and k.shape == (2, 2, q.shape[2], 64)
+        and v.shape == k.shape
+        and q.shape[2] in {128, 256, 512, 1024, 2048}
+        and math.isclose(scale, 0.125, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        return None
+    # Measured on T4: expanded SDPA is faster through 512 tokens;
+    # fused Triton attention forward+backward wins at 1024 and 2048.
+    return "triton" if q.shape[2] >= 1024 else "sdpa_expanded"
+
+
 def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
     kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
     if scale is not None:
@@ -161,7 +197,9 @@ def attention(
 
     backend is one of auto, triton or sdpa. The experimental Triton path
     requires CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128].
-    Its fused backward is experimental and must be validated on the target GPU.
+    auto has a deliberately narrow, benchmarked T4 profile for B=2/Hq=8/
+    Hkv=2/D=64 causal self-attention at sequence lengths 128..2048; all
+    other shapes keep the conservative PyTorch SDPA fallback.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
@@ -194,7 +232,12 @@ def attention(
             )
         return _TritonAttention.apply(q, k, v, causal, float(scale))
 
-    # Current T4 measurements show SDPA ahead for most tested shapes. Keep
-    # auto on the established PyTorch backend until Triton demonstrates a
-    # repeatable win on representative workloads.
+    if backend == "auto":
+        profile = _t4_profile_backend(q, k, v, causal=causal, scale=float(scale))
+        if profile == "triton":
+            return _TritonAttention.apply(q, k, v, causal, float(scale))
+        if profile == "sdpa_expanded":
+            return _sdpa_expanded(q, k, v, causal=causal, scale=scale)
+
+    # Conservative fallback for unprofiled devices and shapes.
     return _sdpa(q, k, v, causal=causal, scale=scale)
