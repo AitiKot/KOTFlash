@@ -183,7 +183,11 @@ def triton_turing_supported() -> bool:
     return parts == (3, 2)
 
 
-def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32, block_n: int = 64):
+def attention_forward(
+    q, k, v, *, causal: bool, scale: float,
+    block_m: int = 64, block_n: int = 32,
+    num_warps: int = 4, num_stages: int = 2,
+):
     """Run Triton forward on contiguous [B,H,S,D] FP16 CUDA tensors."""
     if triton is None:
         raise RuntimeError("Triton is not installed. Install a Turing-compatible Triton 3.2.x build.")
@@ -199,6 +203,8 @@ def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32,
         raise ValueError("Triton kernel expects contiguous inputs")
     if block_m <= 0 or block_n <= 0:
         raise ValueError("block_m and block_n must be positive")
+    if num_warps <= 0 or num_stages <= 0:
+        raise ValueError("num_warps and num_stages must be positive")
 
     b, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
@@ -210,7 +216,7 @@ def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32,
         q, k, v, out, lse,
         sq, sk, hq, hkv, d, scale, causal,
         block_m, block_n, block_d, tail_d,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out, lse
