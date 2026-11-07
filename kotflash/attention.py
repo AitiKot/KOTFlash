@@ -62,6 +62,11 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
         and q.dtype == torch.float16
         and triton_turing_supported()
         and torch.cuda.get_device_capability(q.device) == (7, 5)
+        # The timing profile was measured on this exact PyTorch/CUDA stack.
+        # Other versions may choose different SDPA kernels, so keep the
+        # conservative fallback until they have their own measurements.
+        and torch.__version__.split("+", 1)[0] == "2.6.0"
+        and torch.version.cuda == "12.4"
         and causal
         and q.shape == (2, 8, q.shape[2], 64)
         and k.shape == (2, 2, q.shape[2], 64)
@@ -197,9 +202,10 @@ def attention(
 
     backend is one of auto, triton or sdpa. The experimental Triton path
     requires CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128].
-    auto has a deliberately narrow, benchmarked T4 profile for B=2/Hq=8/
-    Hkv=2/D=64 causal self-attention at sequence lengths 128..2048; all
-    other shapes keep the conservative PyTorch SDPA fallback.
+    auto has a deliberately narrow T4 profile measured on PyTorch
+    2.6.0+cu124 and Triton 3.2.x for B=2/Hq=8/Hkv=2/D=64 causal
+    self-attention at sequence lengths 128..2048; other stacks and shapes
+    keep the conservative PyTorch SDPA fallback.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
