@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from .kernels.triton_forward import attention_forward, triton_turing_supported
+from .kernels.triton_backward import attention_backward
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -136,7 +137,7 @@ class _TritonAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         q, k, v, out, lse = ctx.saved_tensors
-        grads = _blockwise_backward(
+        grads = attention_backward(
             q, k, v, out, lse, grad_out.contiguous(),
             causal=ctx.causal, scale=ctx.scale,
         )
