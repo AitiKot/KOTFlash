@@ -1,0 +1,11 @@
+KOTFlash
+Copyright 2026 KOTFlash contributors.
+
+KOTFlash is an independent project. It is not affiliated with, endorsed by,
+or sponsored by NVIDIA, PyTorch, Triton, Dao-AILab, or the authors of other
+attention implementations. Names of third-party projects are used only to
+identify compatibility targets and optional runtime dependencies.
+
+No source files from FlashAttention, CUTLASS, or other third-party attention
+kernels are vendored in this repository. Triton, when installed separately,
+remains subject to its own license and notices.
