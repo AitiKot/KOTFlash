@@ -106,6 +106,14 @@ python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 16 --
 
 The benchmark compares SDPA, Triton and auto on the same input shape. It reports forward latency, forward+backward latency, incremental peak allocated memory, and maximum absolute error. Record the GPU model, driver, CUDA runtime, PyTorch and Triton versions with any published result. Benchmark results from other GPUs are not T4 results.
 
+For a T4-specific forward tile sweep, run:
+
+```bash
+python benchmarks/tune_triton_tiles.py --seq 1024 --head-dim 72 --causal
+```
+
+The tuner measures all nine combinations of `BM={16,32,64}` and `BN={32,64,128}`, compares them with SDPA, and prints numerical error. Run it separately for the shapes and causal modes you care about; the best tile can vary by workload.
+
 ## Architecture notes
 
 - Forward uses online softmax and a tiled Q × Kᵀ / P × V loop. The full `[Sq, Sk]` attention matrix is never stored.
