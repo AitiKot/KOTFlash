@@ -40,6 +40,9 @@ def test_triton_forward_matches_sdpa(head_dim, causal):
         (8, 2, 48, 64, 72, False),  # GQA, split head dimension
         (4, 4, 48, 64, 96, True),   # MHA, split head dimension
         (8, 1, 64, 48, 128, False), # MQA, largest supported head dimension
+        (8, 2, 1024, 1024, 64, True), # Long causal GQA: split K/V reduction
+        (4, 1, 1024, 768, 32, False), # Long unequal-length MQA: split reduction
+        (4, 2, 2048, 2048, 32, True), # Long sequence: maximum split count
     ],
 )
 def test_triton_backward_matches_sdpa(
