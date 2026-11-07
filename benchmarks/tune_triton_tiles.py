@@ -10,8 +10,12 @@ import statistics
 
 import torch
 import torch.nn.functional as F
+import triton
 
-from kotflash.kernels.triton_forward import attention_forward
+from kotflash.kernels.triton_forward import (
+    attention_forward,
+    triton_turing_supported,
+)
 
 
 def median_cuda_ms(fn, warmup: int, iterations: int) -> float:
@@ -56,12 +60,27 @@ def main():
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument(
+        "--allow-unsupported-triton",
+        action="store_true",
+        help="run anyway for diagnostics; results are not valid T4 performance claims",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         parser.error("CUDA is required")
     if torch.cuda.get_device_capability() != (7, 5):
         parser.error("This tuner is intended for NVIDIA T4 / SM75")
+    if not triton_turing_supported():
+        message = (
+            f"T4 tuning requires upstream Triton 3.2.x; detected {triton.__version__}. "
+            "Upstream Triton 3.3+ dropped Turing (SM75) support. "
+            "Use a compatible T4 environment, or pass --allow-unsupported-triton "
+            "only for diagnostics (not valid performance measurements)."
+        )
+        if not args.allow_unsupported_triton:
+            parser.error(message)
+        print("WARNING: " + message, flush=True)
     if args.batch <= 0 or args.q_heads <= 0 or args.kv_heads <= 0:
         parser.error("batch and head counts must be positive")
     if args.q_heads % args.kv_heads:
@@ -137,6 +156,8 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "compute_capability": torch.cuda.get_device_capability(),
         "torch": torch.__version__,
+        "triton": triton.__version__,
+        "t4_compatibility_override": args.allow_unsupported_triton,
         "shape": {
             "B": args.batch, "H_Q": args.q_heads, "H_KV": args.kv_heads,
             "SEQ": args.seq, "D": args.head_dim,
