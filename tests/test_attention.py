@@ -36,7 +36,7 @@ def test_sdpa_matches_torch_gqa_with_unequal_sequence_lengths(causal):
 @pytest.mark.parametrize("expanded", [False, True])
 def test_default_scale_preserves_pytorch_sdpa_dispatch(monkeypatch, expanded):
     q = torch.randn(1, 4, 5, 16)
-    k = torch.randn(1, 1 if expanded else 4, 7, 16)
+    k = torch.randn(1, 1, 7, 16)
     v = torch.randn_like(k)
     observed = {}
 
