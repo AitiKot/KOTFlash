@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). It has measured modest gains for selected long self-attention workloads and now includes an experimental split-KV path for autoregressive decode. Full decoder-block and full-model training speedups have not been established.
 
-> **Status: alpha / base attention path: 48/48 tests passed on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** The new split-KV decode path adds four GPU test cases and still needs its own physical-T4 run before it can be considered validated.
+> **Status: alpha / split-KV decode correctness: 52/52 tests passed on physical Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** The decode benchmark shows shape-dependent results; see the measured table below. Full-model generation speedup has not been measured.
 
 ## What works today
 
@@ -16,7 +16,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | Base attention path: user-reported Tesla T4 run **48/48 passed**; new split-KV decode tests await a fresh T4 run |
+| Physical T4 validation | User-reported Tesla T4 run: **52/52 passed**, including split-KV decode |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
 | Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64); no cache manager or paging |
@@ -70,6 +70,16 @@ next_token_context = attention(
 
 The split-KV route is selected inside the explicit Triton backend when `Sq <= 16`, `Sk >= 1024`, `D <= 64`, and causal masking is disabled. It returns the same output and log-sum-exp representation used by the fused backward. The library does not allocate, append to, or manage a model's KV cache. Do not use this non-causal mode when the supplied K/V contains keys that should be masked from any query; use the ordinary causal path instead.
 
+On the measured Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0 stack, the short-query decode benchmark produced these forward medians (B=2, Hq=8, Hkv=2, D=64, FP16; five interleaved rounds):
+
+| Q / KV | Native GQA SDPA | Expanded-KV SDPA | Triton Split-KV | Triton vs expanded |
+|---:|---:|---:|---:|---:|
+| 1 / 2048 | 0.358 ms | 0.264 ms | 0.240 ms | **1.10x** |
+| 4 / 1024 | 0.374 ms | 0.174 ms | 0.240 ms | 0.73x |
+| 16 / 4096 | 1.035 ms | 0.447 ms | 0.235 ms | **1.90x** |
+
+The native GQA path was slower than expanded-KV SDPA in these runs, so expanded-KV SDPA is the stronger comparison. Split-KV wins at Q=1 and Q=16 but loses at Q=4. Accordingly, the measured `auto` profile routes only the exact tested shapes: (Q,KV)=(1,2048) to Triton, (4,1024) to expanded-KV SDPA, and (16,4096) to Triton. Other decode shapes and software stacks retain the conservative fallback. These are attention-only timings and must not be presented as end-to-end model tokens/second.
+
 Benchmark this decode case on a physical T4:
 
 ```bash
@@ -115,7 +125,7 @@ attention(q, k, v, *, causal=False, scale=None, backend='auto')
 - `scale=None` uses `1 / sqrt(D)`
 - `backend`: `auto`, `triton` or `sdpa`
 
-The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. `auto` uses a narrow T4 profile only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes; every other shape or software stack falls back to PyTorch SDPA.
+The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. `auto` uses narrow T4 profiles only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes: causal training attention at Sq=Sk 128..2048, plus three non-causal decode cases described above. Every other shape or software stack falls back to PyTorch SDPA.
 
 ## Tests and benchmark
 
