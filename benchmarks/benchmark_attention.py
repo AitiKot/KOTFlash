@@ -7,7 +7,15 @@ import argparse
 import json
 import random
 import statistics
+import sys
 import time
+from pathlib import Path
+
+# Make direct execution work from a fresh repository checkout:
+# `python benchmarks/benchmark_attention.py` sets sys.path[0] to benchmarks/.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 import torch.nn.functional as F
