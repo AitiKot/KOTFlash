@@ -2,9 +2,9 @@
 
 **Experimental memory-efficient attention for NVIDIA Turing (SM75), exposed through a general PyTorch API.**
 
-KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). The custom path has passed user-run correctness tests on a Tesla T4 and has shown gains for selected attention and synthetic decoder-block shapes. It remains experimental: performance varies by sequence length, and full-model training speedup has not been established.
+KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). It has measured modest gains for selected long self-attention workloads and now includes an experimental split-KV path for autoregressive decode. Full decoder-block and full-model training speedups have not been established.
 
-> **Status: alpha / latest user-run Tesla T4 validation: 48/48 tests passed on PyTorch 2.6.0+cu124 and Triton 3.2.0.** The current branch also has a five-round interleaved attention benchmark on the same T4 stack. Performance claims are limited to the profiled workload.
+> **Status: alpha / base attention path: 48/48 tests passed on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** The new split-KV decode path adds four GPU test cases and still needs its own physical-T4 run before it can be considered validated.
 
 ## What works today
 
@@ -16,10 +16,10 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | User-reported Tesla T4 run: **48/48 passed**, including auto-route/fallback checks and long split-query backward |
+| Physical T4 validation | Base attention path: user-reported Tesla T4 run **48/48 passed**; new split-KV decode tests await a fresh T4 run |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
-| Dropout, local window, KV cache | Not implemented |
+| Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64); no cache manager or paging |
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
 
