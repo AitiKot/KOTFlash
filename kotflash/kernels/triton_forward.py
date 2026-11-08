@@ -167,6 +167,7 @@ if triton is not None:
     @triton.jit
     def _attention_fwd_split_kv(
         Q, K, V, PART_O, PART_LSE,
+        BATCH: tl.constexpr,
         Sq: tl.constexpr, Sk: tl.constexpr,
         Hq: tl.constexpr, Hkv: tl.constexpr,
         D: tl.constexpr, SCALE: tl.constexpr,
@@ -243,13 +244,13 @@ if triton is not None:
         )
 
         partial_base = (
-            ((pid_split * 2 + pid_b) * Hq + pid_h) * Sq * D
+            ((pid_split * BATCH + pid_b) * Hq + pid_h) * Sq * D
         )
         partial_o_ptrs = (
             PART_O + partial_base + offs_m[:, None] * D + offs_d[None, :]
         )
         partial_lse_base = (
-            ((pid_split * 2 + pid_b) * Hq + pid_h) * Sq
+            ((pid_split * BATCH + pid_b) * Hq + pid_h) * Sq
         )
         tl.store(
             partial_o_ptrs,
@@ -266,6 +267,7 @@ if triton is not None:
     @triton.jit
     def _attention_fwd_split_kv_reduce(
         PART_O, PART_LSE, O, LSE,
+        BATCH: tl.constexpr,
         Sq: tl.constexpr, Hq: tl.constexpr,
         D: tl.constexpr, NUM_SPLITS: tl.constexpr,
         SPLIT_PAD: tl.constexpr,
@@ -282,7 +284,7 @@ if triton is not None:
 
         lse_ptrs = (
             PART_LSE
-            + (offs_s[:, None] * 2 * Hq + pid_b * Hq + pid_h) * Sq
+            + (offs_s[:, None] * BATCH * Hq + pid_b * Hq + pid_h) * Sq
             + offs_m[None, :]
         )
         lse_all = tl.load(
@@ -305,14 +307,14 @@ if triton is not None:
         for split_idx in range(NUM_SPLITS):
             lse_s = tl.load(
                 PART_LSE
-                + (split_idx * 2 * Hq + pid_b * Hq + pid_h) * Sq
+                + (split_idx * BATCH * Hq + pid_b * Hq + pid_h) * Sq
                 + offs_m,
                 mask=offs_m < Sq,
                 other=float("-inf"),
             )
             weight = tl.exp(lse_s - safe_max) / safe_denom
             part_base = (
-                ((split_idx * 2 + pid_b) * Hq + pid_h) * Sq * D
+                ((split_idx * BATCH + pid_b) * Hq + pid_h) * Sq * D
             )
             part_ptrs = (
                 PART_O + part_base + offs_m[:, None] * D + offs_d[None, :]
@@ -412,7 +414,7 @@ def attention_forward(
             (num_splits, b, hq)
         ](
             q, k, v, partial_o, partial_lse,
-            sq, sk, hq, hkv, d, scale,
+            b, sq, sk, hq, hkv, d, scale,
             chunk_n, blocks_per_split,
             block_m_decode, block_n_decode, triton.next_power_of_2(d),
             num_warps=4,
@@ -422,7 +424,7 @@ def attention_forward(
             (triton.cdiv(sq, block_m_decode), b, hq)
         ](
             partial_o, partial_lse, out, lse,
-            sq, hq, d, num_splits, triton.next_power_of_2(num_splits),
+            b, sq, hq, d, num_splits, triton.next_power_of_2(num_splits),
             block_m_decode, triton.next_power_of_2(d),
             num_warps=4,
             num_stages=1,
