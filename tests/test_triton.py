@@ -89,12 +89,47 @@ def test_t4_auto_profile_selects_measured_backend(seq, expected_backend):
     assert selected == expected_backend
 
 
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq", "expected_backend"),
+    [
+        (1, 2048, "triton"),
+        (4, 1024, "sdpa_expanded"),
+        (16, 4096, "triton"),
+    ],
+)
+def test_t4_auto_decode_profile_selects_and_matches_sdpa(
+    q_seq, kv_seq, expected_backend
+):
+    torch.manual_seed(19)
+    q = torch.randn(2, 8, q_seq, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(2, 2, kv_seq, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+
+    selected = _t4_profile_backend(q, k, v, causal=False, scale=0.125)
+    assert selected == expected_backend
+
+    actual = attention(q, k, v, causal=False, backend="auto")
+    expected = F.scaled_dot_product_attention(
+        q, k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1), is_causal=False,
+    )
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
 def test_t4_auto_profile_rejects_unprofiled_cases():
     q = torch.empty(2, 8, 512, 64, device="cuda", dtype=torch.float16)
     k = torch.empty(2, 2, 512, 64, device="cuda", dtype=torch.float16)
     v = torch.empty_like(k)
 
     assert _t4_profile_backend(q, k, v, causal=False, scale=0.125) is None
+
+    # Decode profiles are intentionally exact; nearby lengths must fall back.
+    q_decode = torch.empty(2, 8, 4, 64, device="cuda", dtype=torch.float16)
+    k_decode = torch.empty(2, 2, 1025, 64, device="cuda", dtype=torch.float16)
+    assert _t4_profile_backend(
+        q_decode, k_decode, torch.empty_like(k_decode),
+        causal=False, scale=0.125,
+    ) is None
     assert _t4_profile_backend(q, k, v, causal=True, scale=0.1) is None
     assert _t4_profile_backend(q[:, :, :-1], k[:, :, :-1], v[:, :, :-1],
                                causal=True, scale=0.125) is None
