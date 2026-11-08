@@ -163,6 +163,188 @@ if triton is not None:
         )
 
 
+
+    @triton.jit
+    def _attention_fwd_split_kv(
+        Q, K, V, PART_O, PART_LSE,
+        Sq: tl.constexpr, Sk: tl.constexpr,
+        Hq: tl.constexpr, Hkv: tl.constexpr,
+        D: tl.constexpr, SCALE: tl.constexpr,
+        CHUNK_N: tl.constexpr, BLOCKS_PER_SPLIT: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+    ):
+        """Parallel split-KV forward for short-query, long-cache decoding."""
+        pid_split = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        kv_h = pid_h // (Hq // Hkv)
+
+        offs_m = tl.arange(0, BM)
+        offs_n = tl.arange(0, BN)
+        offs_d = tl.arange(0, BD)
+
+        q_base = ((pid_b * Hq + pid_h) * Sq + offs_m[:, None]) * D
+        q = tl.load(
+            Q + q_base + offs_d[None, :],
+            mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
+            other=0.0,
+        )
+
+        m_i = tl.full((BM,), float("-inf"), tl.float32)
+        l_i = tl.zeros((BM,), tl.float32)
+        acc = tl.zeros((BM, BD), tl.float32)
+
+        split_start = pid_split * CHUNK_N
+        split_end = tl.minimum(split_start + CHUNK_N, Sk)
+
+        for block_idx in range(BLOCKS_PER_SPLIT):
+            key_pos = split_start + block_idx * BN + offs_n
+            k_ptrs = (
+                K + ((pid_b * Hkv + kv_h) * Sk + key_pos[None, :]) * D
+                + offs_d[:, None]
+            )
+            v_ptrs = (
+                V + ((pid_b * Hkv + kv_h) * Sk + key_pos[:, None]) * D
+                + offs_d[None, :]
+            )
+            k = tl.load(
+                k_ptrs,
+                mask=(key_pos[None, :] < split_end) & (offs_d[:, None] < D),
+                other=0.0,
+            )
+            v = tl.load(
+                v_ptrs,
+                mask=(key_pos[:, None] < split_end) & (offs_d[None, :] < D),
+                other=0.0,
+            )
+
+            scores = tl.dot(q, k) * SCALE
+            valid = (offs_m[:, None] < Sq) & (key_pos[None, :] < split_end)
+            scores = tl.where(valid, scores, float("-inf"))
+
+            block_max = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, block_max)
+            alpha = tl.where(
+                m_i == float("-inf"),
+                0.0,
+                tl.exp(m_i - m_new),
+            )
+            p = tl.where(valid, tl.exp(scores - m_new[:, None]), 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            m_i = m_new
+
+        safe_l = tl.maximum(l_i, 1.0)
+        partial_o = tl.where(l_i[:, None] > 0.0, acc / safe_l[:, None], 0.0)
+        partial_lse = tl.where(
+            l_i > 0.0,
+            m_i + tl.log(l_i),
+            float("-inf"),
+        )
+
+        partial_base = (
+            ((pid_split * 2 + pid_b) * Hq + pid_h) * Sq * D
+        )
+        partial_o_ptrs = (
+            PART_O + partial_base + offs_m[:, None] * D + offs_d[None, :]
+        )
+        partial_lse_base = (
+            ((pid_split * 2 + pid_b) * Hq + pid_h) * Sq
+        )
+        tl.store(
+            partial_o_ptrs,
+            partial_o,
+            mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
+        )
+        tl.store(
+            PART_LSE + partial_lse_base + offs_m,
+            partial_lse,
+            mask=offs_m < Sq,
+        )
+
+
+    @triton.jit
+    def _attention_fwd_split_kv_reduce(
+        PART_O, PART_LSE, O, LSE,
+        Sq: tl.constexpr, Hq: tl.constexpr,
+        D: tl.constexpr, NUM_SPLITS: tl.constexpr,
+        SPLIT_PAD: tl.constexpr,
+        BM: tl.constexpr, BD: tl.constexpr,
+    ):
+        """Merge split-KV partial outputs using their log-sum-exp weights."""
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        pid_h = tl.program_id(2)
+
+        offs_m = pid_m * BM + tl.arange(0, BM)
+        offs_d = tl.arange(0, BD)
+        offs_s = tl.arange(0, SPLIT_PAD)
+
+        lse_ptrs = (
+            PART_LSE
+            + (offs_s[:, None] * 2 * Hq + pid_b * Hq + pid_h) * Sq
+            + offs_m[None, :]
+        )
+        lse_all = tl.load(
+            lse_ptrs,
+            mask=(offs_s[:, None] < NUM_SPLITS) & (offs_m[None, :] < Sq),
+            other=float("-inf"),
+        )
+        row_max = tl.max(lse_all, axis=0)
+        exp_weights = tl.exp(lse_all - row_max[None, :])
+        exp_weights = tl.where(
+            (offs_s[:, None] < NUM_SPLITS) & (offs_m[None, :] < Sq),
+            exp_weights,
+            0.0,
+        )
+        denom = tl.sum(exp_weights, axis=0)
+        safe_max = tl.where(denom > 0.0, row_max, 0.0)
+        safe_denom = tl.maximum(denom, 1.0)
+
+        out_acc = tl.zeros((BM, BD), tl.float32)
+        for split_idx in range(NUM_SPLITS):
+            lse_s = tl.load(
+                PART_LSE
+                + (split_idx * 2 * Hq + pid_b * Hq + pid_h) * Sq
+                + offs_m,
+                mask=offs_m < Sq,
+                other=float("-inf"),
+            )
+            weight = tl.exp(lse_s - safe_max) / safe_denom
+            part_base = (
+                ((split_idx * 2 + pid_b) * Hq + pid_h) * Sq * D
+            )
+            part_ptrs = (
+                PART_O + part_base + offs_m[:, None] * D + offs_d[None, :]
+            )
+            part = tl.load(
+                part_ptrs,
+                mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
+                other=0.0,
+            )
+            out_acc += weight[:, None] * part
+
+        out_ptrs = (
+            O + ((pid_b * Hq + pid_h) * Sq + offs_m[:, None]) * D
+            + offs_d[None, :]
+        )
+        tl.store(
+            out_ptrs,
+            out_acc,
+            mask=(offs_m[:, None] < Sq) & (offs_d[None, :] < D),
+        )
+        row_lse = tl.where(
+            denom > 0.0,
+            row_max + tl.log(denom),
+            float("-inf"),
+        )
+        tl.store(
+            LSE + (pid_b * Hq + pid_h) * Sq + offs_m,
+            row_lse,
+            mask=offs_m < Sq,
+        )
+
+
 def triton_available() -> bool:
     return triton is not None
 
@@ -210,6 +392,43 @@ def attention_forward(
     _, hkv, sk, _ = k.shape
     out = q.new_empty((b, hq, sq, d))
     lse = q.new_empty((b, hq, sq), dtype=torch.float32)
+
+    # During autoregressive decoding, Q is short while K/V may contain
+    # thousands of cached tokens. Splitting K/V exposes more independent
+    # CTAs than one CTA per query head and avoids under-utilizing T4.
+    if not causal and sq <= 16 and sk >= 1024 and d <= 64:
+        block_m_decode = 16
+        block_n_decode = 64
+        num_splits = min(16, triton.cdiv(sk, 128))
+        chunk_n = triton.cdiv(sk, num_splits)
+        blocks_per_split = triton.cdiv(chunk_n, block_n_decode)
+        partial_o = torch.empty(
+            (num_splits, b, hq, sq, d), device=q.device, dtype=torch.float32
+        )
+        partial_lse = torch.empty(
+            (num_splits, b, hq, sq), device=q.device, dtype=torch.float32
+        )
+        _attention_fwd_split_kv[
+            (num_splits, b, hq)
+        ](
+            q, k, v, partial_o, partial_lse,
+            sq, sk, hq, hkv, d, scale,
+            chunk_n, blocks_per_split,
+            block_m_decode, block_n_decode, triton.next_power_of_2(d),
+            num_warps=4,
+            num_stages=1,
+        )
+        _attention_fwd_split_kv_reduce[
+            (triton.cdiv(sq, block_m_decode), b, hq)
+        ](
+            partial_o, partial_lse, out, lse,
+            sq, hq, d, num_splits, triton.next_power_of_2(num_splits),
+            block_m_decode, triton.next_power_of_2(d),
+            num_warps=4,
+            num_stages=1,
+        )
+        return out, lse
+
     block_d = triton.next_power_of_2(d)
     tail_d = max(16, triton.next_power_of_2(max(1, d - 64)))
     _attention_fwd_kernel[(triton.cdiv(sq, block_m), b, hq)](
