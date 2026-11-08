@@ -40,15 +40,29 @@ def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise ValueError("Sequence dimensions must be non-zero")
 
 
+def _sdpa_kwargs(q, *, causal: bool, scale: Optional[float]):
+    """Build SDPA kwargs without overriding PyTorch's default-scale path.
+
+    Passing the mathematically default scale explicitly can change which
+    optimized SDPA kernel PyTorch dispatches. Preserve scale=None whenever
+    the caller requests the standard 1/sqrt(head_dim) scaling.
+    """
+    kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
+    default_scale = 1.0 / math.sqrt(q.shape[-1])
+    if scale is not None and not math.isclose(
+        scale, default_scale, rel_tol=0.0, abs_tol=1e-12
+    ):
+        kwargs["scale"] = scale
+    return kwargs
+
+
 def _sdpa_expanded(q, k, v, *, causal: bool, scale: Optional[float]):
     """Run SDPA after expanding grouped KV heads (useful on Turing)."""
     if q.shape[1] != k.shape[1]:
         repeat = q.shape[1] // k.shape[1]
         k = k.repeat_interleave(repeat, dim=1)
         v = v.repeat_interleave(repeat, dim=1)
-    kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
-    if scale is not None:
-        kwargs["scale"] = scale
+    kwargs = _sdpa_kwargs(q, causal=causal, scale=scale)
     return F.scaled_dot_product_attention(q, k, v, **kwargs)
 
 
@@ -114,9 +128,7 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
 
 
 def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
-    kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
-    if scale is not None:
-        kwargs["scale"] = scale
+    kwargs = _sdpa_kwargs(q, causal=causal, scale=scale)
 
     if q.shape[1] != k.shape[1]:
         try:
