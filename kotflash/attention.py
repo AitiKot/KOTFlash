@@ -71,8 +71,10 @@ def _is_measured_t4_runtime(device_index: int) -> bool:
 def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
     """Return a backend only for the exact T4 profile measured so far.
 
-    Profile: contiguous B=2, Hq=8, Hkv=2, D=64 FP16 causal self-attention
-    at measured sequence lengths on Tesla T4 / SM75.
+    Profiles: contiguous B=2, Hq=8, Hkv=2, D=64 FP16 on Tesla T4 / SM75.
+    Causal self-attention uses measured Sq=Sk lengths 128..2048. The
+    non-causal decode profile is limited to three exact (Sq, Sk) pairs:
+    (1, 2048), (4, 1024), and (16, 4096).
     """
     if not q.is_cuda or q.dtype != torch.float16:
         return None
@@ -85,12 +87,25 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
         q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
-        and causal
-        and q.shape == (2, 8, q.shape[2], 64)
-        and k.shape == (2, 2, q.shape[2], 64)
         and v.shape == k.shape
-        and q.shape[2] in {128, 256, 512, 1024, 2048}
         and math.isclose(scale, 0.125, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        return None
+
+    # Separately measured non-causal long-cache decode cases. Do not
+    # generalize these choices to nearby shapes or other software stacks.
+    if not causal:
+        decode_shapes = {
+            ((2, 8, 1, 64), (2, 2, 2048, 64)): "triton",
+            ((2, 8, 4, 64), (2, 2, 1024, 64)): "sdpa_expanded",
+            ((2, 8, 16, 64), (2, 2, 4096, 64)): "triton",
+        }
+        return decode_shapes.get((tuple(q.shape), tuple(k.shape)))
+
+    if not (
+        q.shape == (2, 8, q.shape[2], 64)
+        and k.shape == (2, 2, q.shape[2], 64)
+        and q.shape[2] in {128, 256, 512, 1024, 2048}
     ):
         return None
     # Measured on T4: expanded SDPA is faster through 512 tokens;
@@ -225,7 +240,9 @@ def attention(
     K/V entries visible to every query. auto has a deliberately narrow
     training-attention profile measured on PyTorch 2.6.0+cu124 and Triton
     3.2.x for B=2/Hq=8/Hkv=2/D=64 causal self-attention at sequence
-    lengths 128..2048; all other stacks and shapes keep SDPA fallback.
+    lengths 128..2048. The same stack has a separate non-causal decode
+    profile for (Sq, Sk)=(1,2048), (4,1024), and (16,4096), routing each
+    to its measured winner. All other stacks and shapes keep SDPA fallback.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
