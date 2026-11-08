@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). It has measured modest gains for selected long self-attention workloads and now includes an experimental split-KV path for autoregressive decode. Full decoder-block and full-model training speedups have not been established.
 
-> **Status: alpha / split-KV decode correctness: 52/52 tests passed on physical Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** The decode benchmark shows shape-dependent results; see the measured table below. Full-model generation speedup has not been measured.
+> **Status: alpha / split-KV kernel correctness: 52/52 tests passed on physical Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** Three additional tests for the newly added automatic decode routing still need a physical-T4 rerun. The decode benchmark shows shape-dependent results; see the measured table below. Full-model generation speedup has not been measured.
 
 ## What works today
 
@@ -16,7 +16,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | User-reported Tesla T4 run: **52/52 passed**, including split-KV decode |
+| Physical T4 validation | Split-KV implementation: user-reported Tesla T4 run **52/52 passed**; new auto-routing tests await rerun |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
 | Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64); no cache manager or paging |
@@ -206,7 +206,7 @@ User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2
 These are user-reported single-run results for a synthetic one-block training benchmark, not a full-model guarantee. The long-sequence split path is now correctness-tested on T4; further tuning is needed to turn its attention-level gain into a consistent whole-block training speedup.
 
 ## Automatic T4 backend profile
-`backend="auto"` uses a deliberately narrow profile measured on **Tesla T4 / SM75**, PyTorch **2.6.0+cu124** and Triton **3.2.x**. The profile only matches contiguous FP16 inputs with B=2, Hq=8, Hkv=2, D=64, causal self-attention, default scale 0.125 and Sq=Sk in {128, 256, 512, 1024, 2048}. For 128–512 tokens it expands K/V and uses PyTorch SDPA; for 1024–2048 it selects fused Triton. GPU tests assert both the selected route and numerical output. Other shapes, devices, PyTorch versions, CUDA versions and non-contiguous inputs retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
+`backend="auto"` uses deliberately narrow profiles measured on **Tesla T4 / SM75**, PyTorch **2.6.0+cu124** and Triton **3.2.x**. For contiguous FP16 causal self-attention with B=2, Hq=8, Hkv=2, D=64, default scale 0.125 and Sq=Sk in {128, 256, 512, 1024, 2048}, it uses expanded-KV SDPA at 128–512 and fused Triton at 1024–2048. For non-causal decode on the same stack and batch/head/dimension profile, it has three exact measured cases: (Sq,Sk)=(1,2048) selects Triton, (4,1024) selects expanded-KV SDPA, and (16,4096) selects Triton. GPU tests assert both the selected route and numerical output. Other shapes, devices, PyTorch versions, CUDA versions and non-contiguous inputs retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
 
 ## Architecture notes
 
