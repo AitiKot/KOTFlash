@@ -220,10 +220,12 @@ def attention(
 
     backend is one of auto, triton or sdpa. The experimental Triton path
     requires CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128].
-    auto has a deliberately narrow T4 profile measured on PyTorch
-    2.6.0+cu124 and Triton 3.2.x for B=2/Hq=8/Hkv=2/D=64 causal
-    self-attention at sequence lengths 128..2048; other stacks and shapes
-    keep the conservative PyTorch SDPA fallback.
+    For non-causal short-query decode (Sq <= 16, Sk >= 1024, D <= 64),
+    Triton uses split-KV forward parallelism; the caller must pass only
+    K/V entries visible to every query. auto has a deliberately narrow
+    training-attention profile measured on PyTorch 2.6.0+cu124 and Triton
+    3.2.x for B=2/Hq=8/Hkv=2/D=64 causal self-attention at sequence
+    lengths 128..2048; all other stacks and shapes keep SDPA fallback.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
