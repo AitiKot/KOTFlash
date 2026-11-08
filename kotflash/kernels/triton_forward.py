@@ -372,7 +372,12 @@ def attention_forward(
     block_m: int = 64, block_n: int = 32,
     num_warps: int = 4, num_stages: int = 2,
 ):
-    """Run Triton forward on contiguous [B,H,S,D] FP16 CUDA tensors."""
+    """Run Triton forward on contiguous [B,H,S,D] FP16 CUDA tensors.
+
+    For non-causal short-query decode (Sq <= 16) over long K/V context
+    (Sk >= 1024, D <= 64), use split-KV parallelism to expose more CTAs.
+    The caller must pass only keys visible to every query in that chunk.
+    """
     if triton is None:
         raise RuntimeError("Triton is not installed. Install a Turing-compatible Triton 3.2.x build.")
     import torch
