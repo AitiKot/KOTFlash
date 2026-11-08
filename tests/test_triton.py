@@ -32,6 +32,27 @@ def test_triton_forward_matches_sdpa(head_dim, causal):
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
 
 
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq"),
+    [(1, 2048), (4, 1024), (16, 4096)],
+)
+def test_triton_split_kv_decode_matches_sdpa(q_seq, kv_seq):
+    """Long-cache decode: all keys are already visible to the short Q chunk."""
+    torch.manual_seed(17)
+    q = torch.randn(2, 8, q_seq, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(2, 2, kv_seq, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+
+    actual = attention(q, k, v, causal=False, backend="triton")
+    expected = F.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        is_causal=False,
+    )
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
 @pytest.mark.parametrize("seq", [128, 256, 512, 1024, 2048])
 def test_t4_auto_profile_matches_expanded_sdpa(seq):
     torch.manual_seed(13)
@@ -97,6 +118,7 @@ def test_t4_auto_profile_rejects_unprofiled_cases():
         (8, 2, 1024, 1024, 64, True), # Long causal GQA: split K/V reduction
         (4, 1, 1024, 768, 32, False), # Long unequal-length MQA: split reduction
         (4, 2, 2048, 2048, 32, True), # Long sequence: maximum split count
+        (8, 2, 1, 1024, 64, False),  # Single-token decode with long KV cache
     ],
 )
 def test_triton_backward_matches_sdpa(
