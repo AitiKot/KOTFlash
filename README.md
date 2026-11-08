@@ -70,15 +70,15 @@ next_token_context = attention(
 
 The split-KV route is selected inside the explicit Triton backend when `Sq <= 16`, `Sk >= 1024`, `D <= 64`, and causal masking is disabled. It returns the same output and log-sum-exp representation used by the fused backward. The library does not allocate, append to, or manage a model's KV cache. Do not use this non-causal mode when the supplied K/V contains keys that should be masked from any query; use the ordinary causal path instead.
 
-On the measured Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0 stack, the short-query decode benchmark produced these forward medians (B=2, Hq=8, Hkv=2, D=64, FP16; five interleaved rounds):
+A follow-up run on the measured Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0 stack recorded these forward medians (B=2, Hq=8, Hkv=2, D=64, FP16; five interleaved rounds):
 
-| Q / KV | Native GQA SDPA | Expanded-KV SDPA | Triton Split-KV | Triton vs expanded |
+| Q / KV | Expanded-KV SDPA | Explicit Triton | Auto | Auto vs expanded |
 |---:|---:|---:|---:|---:|
-| 1 / 2048 | 0.358 ms | 0.264 ms | 0.240 ms | **1.10x** |
-| 4 / 1024 | 0.374 ms | 0.174 ms | 0.240 ms | 0.73x |
-| 16 / 4096 | 1.035 ms | 0.447 ms | 0.235 ms | **1.90x** |
+| 1 / 2048 | 0.33549 ms | 0.22106 ms | 0.20326 ms | **1.65x** |
+| 4 / 1024 | 0.15445 ms | 0.21166 ms | 0.15480 ms | 1.00x (parity) |
+| 16 / 4096 | 0.43869 ms | 0.33546 ms | 0.28550 ms | **1.54x** |
 
-The native GQA path was slower than expanded-KV SDPA in these runs, so expanded-KV SDPA is the stronger comparison. Split-KV wins at Q=1 and Q=16 but loses at Q=4. Accordingly, the measured `auto` profile routes only the exact tested shapes: (Q,KV)=(1,2048) to Triton, (4,1024) to expanded-KV SDPA, and (16,4096) to Triton. Other decode shapes and software stacks retain the conservative fallback. These are attention-only timings and must not be presented as end-to-end model tokens/second.
+The corrected automatic dispatch matches the measured winner for each exact decode shape: Triton Split-KV at Q=1 and Q=16, expanded-KV SDPA at Q=4. Explicit Triton and auto select the same Triton kernel for Q=1/Q=16, but their medians differed in this one interleaved run; treat the ratios as indicative single-run measurements, not a guarantee. The benchmark is attention-only and must not be presented as end-to-end model tokens/second. Other decode shapes and software stacks retain the conservative fallback.
 
 Benchmark this decode case on a physical T4:
 
