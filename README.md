@@ -48,6 +48,34 @@ python -m pip install -e '.[test]'
 pytest -q
 ```
 
+## Long-context autoregressive decode (experimental)
+
+KOTFlash includes a split-KV Triton forward path for decoding when the query is short (1–16 positions) and the supplied K/V context is long (at least 1024 positions, head dimension up to 64). It splits the visible K/V cache into independent chunks, computes partial attention results in parallel, and merges them with log-sum-exp weights. This is designed to improve GPU occupancy for single-token or short-chunk generation on Turing GPUs.
+
+For one-token generation, pass only the prefix and current token's K/V entries that the new query is allowed to attend to. Since all supplied keys are already visible to that query, use `causal=False`:
+
+```python
+import torch
+from kotflash import attention
+
+# q: [B, Hq, 1, D] for the next token
+# k_cache, v_cache: [B, Hkv, past_tokens + 1, D]
+# The cache contains only the visible prefix/current-token positions.
+next_token_context = attention(
+    q, k_cache, v_cache,
+    causal=False,
+    backend="triton",
+)
+```
+
+The split-KV route is selected inside the explicit Triton backend when `Sq <= 16`, `Sk >= 1024`, `D <= 64`, and causal masking is disabled. It returns the same output and log-sum-exp representation used by the fused backward. The library does not allocate, append to, or manage a model's KV cache. Do not use this non-causal mode when the supplied K/V contains keys that should be masked from any query; use the ordinary causal path instead.
+
+Benchmark this decode case on a physical T4:
+
+```bash
+python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 8 --kv-heads 2 --seq 1 --kv-seq 2048 --head-dim 64 --warmup 20 --iterations 50 --repeats 5
+```
+
 ## Quick start
 
 ```python
@@ -196,7 +224,8 @@ These are user-reported single-run results for a synthetic one-block training be
 - [x] Add split-dot path for head dimensions 72/96
 - [ ] Profile and tune the split-dot path on T4
 - [ ] Variable-length packed sequences
-- [ ] Dropout, local-window attention and KV-cache variants
+- [x] Experimental split-KV decode for short queries with long caller-managed K/V context
+- [ ] Integrated cache management, paged KV cache and local-window/dropout variants
 - [ ] More PyTorch / Triton compatibility checks
 
 ## Related work and dependencies
