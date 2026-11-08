@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from kotflash import attention
-from kotflash.attention import _blockwise_backward
+from kotflash.attention import _blockwise_backward, _sdpa, _sdpa_expanded
 
 
 def test_sdpa_matches_torch_mha():
@@ -31,6 +31,26 @@ def test_sdpa_matches_torch_gqa_with_unequal_sequence_lengths(causal):
         is_causal=causal,
     )
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+def test_default_scale_preserves_pytorch_sdpa_dispatch(monkeypatch, expanded):
+    q = torch.randn(1, 4, 5, 16)
+    k = torch.randn(1, 1 if expanded else 4, 7, 16)
+    v = torch.randn_like(k)
+    observed = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        observed["kwargs"] = kwargs
+        observed["key_shape"] = tuple(key.shape)
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", fake_sdpa)
+    call = _sdpa_expanded if expanded else _sdpa
+    call(q, k, v, causal=False, scale=1.0 / math.sqrt(16))
+
+    assert "scale" not in observed["kwargs"]
+    assert observed["key_shape"][1] == (4 if expanded else 1)
 
 
 def test_custom_scale_matches_explicit_q_scaling():
