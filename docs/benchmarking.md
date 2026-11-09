@@ -41,7 +41,7 @@ python benchmarks/benchmark_decode.py \
   --output decode-results.json
 ~~~
 
-The reported batch tokens/second is the throughput of one decode position for each item in the batch. It excludes model projections, MLP, sampling and host-side scheduling; it is not full-model tokens/second.
+The benchmark reports both CUDA-event time and synchronized wall-clock time. Batch tokens/second uses wall-clock latency for one decode position per batch. The example's torch.cat update copies the cache and is intentionally a simple reference; production models usually write into preallocated KV storage. Model projections, MLP and sampling are excluded, so this is not full-model tokens/second.
 
 ## Decoder-block training step
 

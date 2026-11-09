@@ -77,6 +77,8 @@ from kotflash import attention
 out = attention(q_new, k_cache, v_cache, causal=False, backend="triton")
 ~~~
 
+The package also exports simple convenience helpers, `append_kv_cache` and `decode_step`, for caller-managed single-token decoding. The `torch.cat` helper copies the existing cache for clarity; production model code should normally write into preallocated KV storage.
+
 For a runnable GQA example that performs prefill, appends a token and runs incremental decode:
 
 ~~~bash
@@ -106,7 +108,7 @@ python benchmarks/benchmark_decode.py \
   --kv-seq 2048 --warmup 20 --iterations 50 --repeats 5
 ~~~
 
-It reports attention-only latency separately from append+attention latency. Throughput is batch throughput for one decode position; model projections, MLP, sampling and host scheduling are excluded.
+It reports GPU-event and synchronized wall-clock latency for attention-only and append+attention. Throughput uses wall-clock time for one decode position per batch. The example uses torch.cat for clarity, which copies the cache; production models should normally write into preallocated KV storage. Model projections, MLP and sampling are excluded.
 
 Synthetic decoder-block training benchmark:
 
@@ -167,7 +169,7 @@ The experimental Triton backend currently requires:
 
 The narrow automatic profile was measured only on Tesla T4 / PyTorch 2.6.0+cu124 / CUDA 12.4 / Triton 3.2.x for exact documented shapes. Other shapes and stacks retain the portable SDPA fallback.
 
-KOTFlash is an attention library, not a full inference engine. It does not manage KV cache allocation, paging or eviction, and it does not include model projections, MLPs, token sampling or a serving runtime.
+KOTFlash is an attention library, not a full inference engine. It offers a simple cache-append convenience helper but no preallocated cache manager, paging or eviction. It does not include model projections, MLPs, token sampling or a serving runtime.
 
 ## Architecture and development
 

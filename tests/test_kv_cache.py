@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from examples.gqa_kv_cache_decode import append_kv_cache, decode_step
+from kotflash.cache import append_kv_cache, decode_step
 
 
 def test_append_kv_cache_preserves_order_and_does_not_mutate_inputs():

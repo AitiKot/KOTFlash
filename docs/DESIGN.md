@@ -40,9 +40,9 @@ Each split writes:
 
 A reduction kernel combines partial outputs using the partial log-sum-exp values as weights. This is mathematically equivalent to a single softmax over the concatenated visible K/V context.
 
-The caller owns the cache. KOTFlash does not append, allocate, page or evict KV entries. The caller must pass only keys visible to every query in the supplied Q chunk. For one-token decoding, when the cache includes the current token and contains no future keys, use `causal=False`.
+The caller owns cache allocation and lifetime. KOTFlash provides a simple `append_kv_cache` / `decode_step` convenience helper implemented with `torch.cat`, but it does not provide preallocated cache writes, paging or eviction. The caller must pass only keys visible to every query in the supplied Q chunk. For one-token decoding, when the cache includes the current token and contains no future keys, use `causal=False`.
 
-The split-KV path is experimental. Its speed depends on query length, cache length, head dimension, GPU and software stack. A measured win for one exact shape must not be generalized to nearby shapes.
+The convenience append helper copies the existing cache and is intended for examples, not high-throughput generation. Production model code should normally append into preallocated storage. The split-KV path is experimental. Its speed depends on query length, cache length, head dimension, GPU and software stack. A measured win for one exact shape must not be generalized to nearby shapes.
 
 ## Triton backward
 

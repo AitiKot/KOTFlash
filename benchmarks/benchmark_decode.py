@@ -11,6 +11,7 @@ import argparse
 import json
 import statistics
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,7 +22,7 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 import torch.nn.functional as F
 
-from examples.gqa_kv_cache_decode import append_kv_cache
+from kotflash.cache import append_kv_cache
 from kotflash import attention, triton_turing_supported
 
 
@@ -44,29 +45,35 @@ def measure(
 
         baseline_bytes = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
-        samples = []
+        gpu_samples = []
+        wall_samples = []
         for _ in range(repeats):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
+            wall_start = time.perf_counter()
             start.record()
             for _ in range(iterations):
                 result = fn()
             end.record()
             synchronize()
-            samples.append(start.elapsed_time(end) / iterations)
+            wall_samples.append((time.perf_counter() - wall_start) * 1000.0 / iterations)
+            gpu_samples.append(start.elapsed_time(end) / iterations)
             del result
 
         peak_bytes = max(
             0, torch.cuda.max_memory_allocated() - baseline_bytes
         )
     return {
-        "median_ms": statistics.median(samples),
-        "min_ms": min(samples),
-        "max_ms": max(samples),
-        "per_repeat_ms": samples,
+        "gpu_median_ms": statistics.median(gpu_samples),
+        "gpu_min_ms": min(gpu_samples),
+        "gpu_max_ms": max(gpu_samples),
+        "gpu_per_repeat_ms": gpu_samples,
+        "wall_median_ms": statistics.median(wall_samples),
+        "wall_min_ms": min(wall_samples),
+        "wall_max_ms": max(wall_samples),
+        "wall_per_repeat_ms": wall_samples,
         "incremental_peak_allocated_bytes": int(peak_bytes),
     }
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -209,7 +216,7 @@ def main() -> None:
         "interpretation": (
             "tokens_per_second is batch throughput for one decode position per batch "
             "and excludes model projections, MLP, sampling and host-side scheduling. "
-            "append_plus_attention includes torch.cat cache-update cost."
+            "append_plus_attention includes torch.cat cache-update cost. GPU event time and synchronized wall-clock time are reported separately."
         ),
     }
 
@@ -227,7 +234,7 @@ def main() -> None:
             repeats=args.repeats,
         )
         decode_result["batch_tokens_per_second"] = (
-            args.batch * 1000.0 / decode_result["median_ms"]
+            args.batch * 1000.0 / decode_result["wall_median_ms"]
         )
         report["results"][name] = {
             "attention_only": attention_result,
@@ -237,8 +244,11 @@ def main() -> None:
     baseline = report["results"]["pytorch_expanded_sdpa"]
     for name, values in report["results"].items():
         for metric in ("attention_only", "append_plus_attention"):
-            values[metric]["speedup_vs_expanded_sdpa"] = (
-                baseline[metric]["median_ms"] / values[metric]["median_ms"]
+            values[metric]["gpu_speedup_vs_expanded_sdpa"] = (
+                baseline[metric]["gpu_median_ms"] / values[metric]["gpu_median_ms"]
+            )
+            values[metric]["wall_speedup_vs_expanded_sdpa"] = (
+                baseline[metric]["wall_median_ms"] / values[metric]["wall_median_ms"]
             )
 
     rendered = json.dumps(report, indent=2, default=str)
