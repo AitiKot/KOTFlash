@@ -53,6 +53,22 @@ def test_triton_split_kv_decode_matches_sdpa(q_seq, kv_seq):
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
 
 
+@pytest.mark.parametrize(
+    ("q_seq", "kv_seq"),
+    [(2, 1537), (8, 8193)],
+)
+def test_triton_split_kv_decode_handles_partial_chunks(q_seq, kv_seq):
+    """Exercise non-divisible KV splits and a cache longer than 8k tokens."""
+    torch.manual_seed(23)
+    q = torch.randn(1, 4, q_seq, 32, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 1, kv_seq, 32, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+
+    actual = attention(q, k, v, causal=False, backend="triton")
+    expected = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
 @pytest.mark.parametrize("seq", [128, 256, 512, 1024, 2048])
 def test_t4_auto_profile_matches_expanded_sdpa(seq):
     torch.manual_seed(13)
