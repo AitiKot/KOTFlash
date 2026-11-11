@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from ._planning import t4_profile_for_shapes
 from .kernels.triton_forward import attention_forward, triton_turing_supported
 from .kernels.triton_backward import attention_backward
 
@@ -85,10 +86,8 @@ def _is_measured_t4_runtime(device_index: int) -> bool:
 def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
     """Return a backend only for the exact T4 profile measured so far.
 
-    Profiles: contiguous B=2, Hq=8, Hkv=2, D=64 FP16 on Tesla T4 / SM75.
-    Causal self-attention uses measured Sq=Sk lengths 128..2048. The
-    non-causal decode profile is limited to three exact (Sq, Sk) pairs:
-    (1, 2048), (4, 1024), and (16, 4096).
+    Runtime checks stay here; shape routing is pure Python in _planning.py so
+    CPU CI can verify the measured profile without importing CUDA or Triton.
     """
     if not q.is_cuda or q.dtype != torch.float16:
         return None
@@ -97,35 +96,11 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
         device_index = torch.cuda.current_device()
     if not _is_measured_t4_runtime(device_index):
         return None
-    if not (
-        q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
-        and v.shape == k.shape
-        and math.isclose(scale, 0.125, rel_tol=0.0, abs_tol=1e-12)
-    ):
-        return None
-
-    # Separately measured non-causal long-cache decode cases. Do not
-    # generalize these choices to nearby shapes or other software stacks.
-    if not causal:
-        decode_shapes = {
-            ((2, 8, 1, 64), (2, 2, 2048, 64)): "triton",
-            ((2, 8, 4, 64), (2, 2, 1024, 64)): "sdpa_expanded",
-            ((2, 8, 16, 64), (2, 2, 4096, 64)): "triton",
-        }
-        return decode_shapes.get((tuple(q.shape), tuple(k.shape)))
-
-    if not (
-        q.shape == (2, 8, q.shape[2], 64)
-        and k.shape == (2, 2, q.shape[2], 64)
-        and q.shape[2] in {128, 256, 512, 1024, 2048}
-    ):
-        return None
-    # Measured on T4: expanded SDPA is faster through 512 tokens;
-    # fused Triton attention forward+backward is the candidate at 1024+.
-    return "triton" if q.shape[2] >= 1024 else "sdpa_expanded"
-
+    contiguous = q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    return t4_profile_for_shapes(
+        tuple(q.shape), tuple(k.shape), tuple(v.shape),
+        causal=causal, scale=scale, contiguous=contiguous,
+    )
 
 def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
     kwargs = _sdpa_kwargs(q, causal=causal, scale=scale)
