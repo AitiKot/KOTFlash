@@ -6,6 +6,8 @@ vendor or copy CUDA/Triton kernels from other attention projects.
 """
 from __future__ import annotations
 
+from .._planning import check_int32_indexing, split_kv_plan
+
 try:
     import triton
     import triton.language as tl
@@ -400,24 +402,22 @@ def attention_forward(
     out = q.new_empty((b, hq, sq, d))
     lse = q.new_empty((b, hq, sq), dtype=torch.float32)
 
-    # During autoregressive decoding, Q is short while K/V may contain
-    # thousands of cached tokens. Splitting K/V exposes more independent
-    # CTAs than one CTA per query head and avoids under-utilizing T4.
-    if not causal and sq <= 16 and sk >= 1024 and d <= 64:
-        block_m_decode = 16
-        block_n_decode = 64
-        num_splits = min(16, triton.cdiv(sk, 128))
-        chunk_n = triton.cdiv(sk, num_splits)
-        blocks_per_split = triton.cdiv(chunk_n, block_n_decode)
+    # Triton kernels use signed 32-bit flat offsets. Guard all input buffers
+    # and the temporary split outputs before allocating or launching kernels.
+    check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
+    plan = split_kv_plan(sq, sk, d, causal=causal)
+    if plan is not None:
+        block_m_decode, block_n_decode = plan.block_m, plan.block_n
+        num_splits, chunk_n = plan.num_splits, plan.chunk_n
+        blocks_per_split = plan.blocks_per_split
+        check_int32_indexing(partial_o=num_splits * b * hq * sq * d)
         partial_o = torch.empty(
             (num_splits, b, hq, sq, d), device=q.device, dtype=torch.float32
         )
         partial_lse = torch.empty(
             (num_splits, b, hq, sq), device=q.device, dtype=torch.float32
         )
-        _attention_fwd_split_kv[
-            (num_splits, b, hq)
-        ](
+        _attention_fwd_split_kv[(num_splits, b, hq)](
             q, k, v, partial_o, partial_lse,
             b, sq, sk, hq, hkv, d, scale,
             chunk_n, blocks_per_split,
