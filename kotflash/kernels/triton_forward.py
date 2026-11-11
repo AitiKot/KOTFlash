@@ -399,18 +399,20 @@ def attention_forward(
 
     b, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
+
+    # Guard before allocating outputs or launching kernels.
+    check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
+    plan = split_kv_plan(sq, sk, d, causal=causal)
+    if plan is not None:
+        check_int32_indexing(partial_o=plan.num_splits * b * hq * sq * d)
+
     out = q.new_empty((b, hq, sq, d))
     lse = q.new_empty((b, hq, sq), dtype=torch.float32)
 
-    # Triton kernels use signed 32-bit flat offsets. Guard all input buffers
-    # and the temporary split outputs before allocating or launching kernels.
-    check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
-    plan = split_kv_plan(sq, sk, d, causal=causal)
     if plan is not None:
         block_m_decode, block_n_decode = plan.block_m, plan.block_n
         num_splits, chunk_n = plan.num_splits, plan.chunk_n
         blocks_per_split = plan.blocks_per_split
-        check_int32_indexing(partial_o=num_splits * b * hq * sq * d)
         partial_o = torch.empty(
             (num_splits, b, hq, sq, d), device=q.device, dtype=torch.float32
         )
