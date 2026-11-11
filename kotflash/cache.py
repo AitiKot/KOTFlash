@@ -91,3 +91,56 @@ def decode_step(
         backend=backend,
     )
     return output, updated_k, updated_v
+
+
+class PreallocatedKVCache:
+    """Fixed-capacity K/V storage for incremental inference.
+
+    Appends write into preallocated buffers. contiguous_view returns a
+    contiguous copy of the populated prefix because Triton currently requires
+    contiguous K/V tensors.
+    """
+
+    def __init__(self, batch: int, kv_heads: int, max_len: int, head_dim: int,
+                 *, device, dtype):
+        if min(batch, kv_heads, max_len, head_dim) <= 0:
+            raise ValueError("batch, kv_heads, max_len and head_dim must be positive")
+        shape = (batch, kv_heads, max_len, head_dim)
+        self.k = torch.empty(shape, device=device, dtype=dtype)
+        self.v = torch.empty(shape, device=device, dtype=dtype)
+        self.max_len = max_len
+        self.length = 0
+
+    def append(self, new_k: torch.Tensor, new_v: torch.Tensor) -> None:
+        if not isinstance(new_k, torch.Tensor) or not isinstance(new_v, torch.Tensor):
+            raise TypeError("new_k and new_v must be torch.Tensor instances")
+        if new_k.ndim != 4 or new_v.ndim != 4:
+            raise ValueError("new K/V must use [B, Hkv, S, D] layout")
+        if new_k.shape != new_v.shape:
+            raise ValueError("new K and V shapes must match")
+        if new_k.shape[0:2] != self.k.shape[0:2] or new_k.shape[3] != self.k.shape[3]:
+            raise ValueError("new K/V batch, heads and head_dim must match the cache")
+        if new_k.shape[2] <= 0:
+            raise ValueError("cannot append an empty K/V sequence")
+        if new_k.device != self.k.device or new_v.device != self.v.device:
+            raise ValueError("new K/V must be on the cache device")
+        if new_k.dtype != self.k.dtype or new_v.dtype != self.v.dtype:
+            raise ValueError("new K/V dtype must match the cache dtype")
+        end = self.length + new_k.shape[2]
+        if end > self.max_len:
+            raise ValueError(
+                f"KV cache full: {self.length} + {new_k.shape[2]} tokens "
+                f"exceeds max_len={self.max_len}"
+            )
+        self.k[:, :, self.length:end].copy_(new_k)
+        self.v[:, :, self.length:end].copy_(new_v)
+        self.length = end
+
+    def contiguous_view(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return only populated cache entries, as contiguous tensors."""
+        if self.length == 0:
+            raise ValueError("KV cache is empty")
+        return (
+            self.k[:, :, :self.length].contiguous(),
+            self.v[:, :, :self.length].contiguous(),
+        )
