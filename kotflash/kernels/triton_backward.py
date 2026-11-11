@@ -2,6 +2,8 @@
 """Fused, memory-bounded Triton backward kernels for NVIDIA SM75."""
 from __future__ import annotations
 
+from .._planning import check_int32_indexing
+
 try:
     import triton
     import triton.language as tl
@@ -360,6 +362,7 @@ def attention_backward(
     _, hkv, sk, _ = k.shape
     group = hq // hkv
     bd = triton.next_power_of_2(d)
+    check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -379,6 +382,7 @@ def attention_backward(
         num_q_tiles = triton.cdiv(sq, block_m)
         num_splits = min(8, triton.cdiv(num_q_tiles, 8))
         q_tiles_per_split = triton.cdiv(num_q_tiles, num_splits)
+        check_int32_indexing(partial_dkv=num_splits * bsz * hkv * sk * d)
         dk_part = torch.empty(
             (num_splits, bsz, hkv, sk, d),
             device=q.device, dtype=torch.float32,
