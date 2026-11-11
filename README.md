@@ -77,7 +77,7 @@ from kotflash import attention
 out = attention(q_new, k_cache, v_cache, causal=False, backend="triton")
 ~~~
 
-The package also exports simple convenience helpers, `append_kv_cache` and `decode_step`, for caller-managed single-token decoding. The `torch.cat` helper copies the existing cache for clarity; production model code should normally write into preallocated KV storage.
+The package also exports simple convenience helpers, `append_kv_cache` and `decode_step`, for caller-managed single-token decoding. The `torch.cat` helper copies the existing cache for clarity; production model code should normally write into preallocated KV storage. For fixed-capacity inference, `kotflash.cache.PreallocatedKVCache` provides validated append-only storage and exposes only the populated prefix. Its `contiguous_view()` still copies that prefix because the current Triton kernels require contiguous K/V.
 
 For a runnable GQA example that performs prefill, appends a token and runs incremental decode:
 
