@@ -171,7 +171,7 @@ def strided_decode_supported(q, k, v) -> bool:
         return False
     if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape:
         return False
-    if q.shape[2] > 16 or k.shape[2] < 1024 or q.shape[-1] > 64:
+    if q.shape[2] > 16 or k.shape[2] < 1024 or not 16 <= q.shape[-1] <= 64:
         return False
     if q.shape[0] != k.shape[0] or q.shape[1] % k.shape[1]:
         return False
