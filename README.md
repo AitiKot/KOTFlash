@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). It has measured modest gains for selected long self-attention workloads and now includes an experimental split-KV path for autoregressive decode. Full decoder-block and full-model training speedups have not been established.
 
-> **Status: alpha / user-reported historical T4 validation: 52/52 split-KV correctness tests passed on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** Follow-up tests for automatic dispatch, chunk-edge cases and newer guards have not yet been rerun on that physical-T4 stack. The decode benchmark shows shape-dependent results; see the measured table below. Full-model generation speedup has not been measured.
+> **Status: alpha / latest user-reported physical-T4 validation (2026-11-13): 107 passed, 1 skipped** on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0. The stride-aware and fused preallocated decode paths passed numerical checks. The synthetic decoder-block training benchmark measured 1.59x versus expanded-KV SDPA and 1.34x versus native GQA SDPA at batch=2, sequence=512. The optional CUDA C++ append extension remains unvalidated because its JIT build prerequisites were incomplete (Ninja was missing). Full-model generation/training speedup has not been measured.
 
 ## What works today
 
@@ -16,10 +16,10 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | Historical user-reported split-KV suite **52/52 passed**; newer auto-routing/chunk-edge tests remain unverified on T4 |
+| Physical T4 validation | Latest user-reported suite **107 passed, 1 skipped**; stride-aware/fused preallocated decode and synthetic decoder-block benchmark validated on T4. Optional CUDA C++ append build still pending |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
-| Caller-managed KV cache | Fixed-capacity storage, inference-only stride-aware T4 decode and optional CUDA C++ append (experimental) |
+| Caller-managed KV cache | Fixed-capacity storage; stride-aware/fused inference-only T4 decode validated; optional CUDA C++ append build remains experimental and unvalidated |
 | Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64) |
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
@@ -105,8 +105,22 @@ This JIT-builds the extension on first use and therefore requires a compatible
 local CUDA toolkit with `nvcc`. To force it for one append, pass
 `append_backend="cuda"`; use `append_backend="torch"` to stay portable.
 The CUDA append operator currently supports FP16 and only performs cache
-writes; attention remains the separate Triton kernel. See
-[docs/kv_cache.md](docs/kv_cache.md) for the API, benchmark and limitations.
+writes; attention remains the separate Triton kernel. Building the extension
+with PyTorch's JIT loader also requires `ninja` and a working C++/CUDA toolchain.
+Install the build helper explicitly with:
+
+```bash
+python -m pip install -e '.[cuda-append]'
+```
+
+To run its opt-in physical-GPU test on a toolkit host:
+
+```bash
+KOTFLASH_TEST_CUDA_APPEND=1 python -m pytest -q tests/test_cuda_append.py
+```
+
+This optional test is separate from the standard Triton validation suite.
+See [docs/kv_cache.md](docs/kv_cache.md) for the API, benchmark and limitations.
 
 The fixed-capacity cache avoids reallocating the K/V history with
 `torch.cat`. For supported short-query inference shapes on SM75, the stride-aware
@@ -114,7 +128,7 @@ Split-KV kernel reads padded cache prefixes directly. The exact measured T4
 append/decode profile fuses the new K/V write with partial attention in one
 launch, followed by a partial-result reduction. Other layouts and
 training-with-grad continue to use the conservative append/autograd path.
-The new paths are experimental until fresh physical-T4 results are reviewed.
+The stride-aware and fused Triton paths were physically validated on Tesla T4 on 2026-11-13; the optional CUDA C++ append build remains experimental until its toolchain-enabled integration test is completed.
 
 ## Quick start
 
@@ -224,6 +238,26 @@ Interpretation:
 - Direct Triton measured 1.18x and 1.04x versus expanded SDPA at 1024 and 2048, respectively. The 1024 direct-Triton and auto results differ by about 0.10 ms despite using the same kernel path; this highlights remaining timing/dispatch variability. The results are medians from one five-round sweep, not a broad statistical study.
 
 These are **standalone attention** measurements, not a full decoder block or full language-model training result. Earlier synthetic decoder-block measurements were near parity at 1024 and about 2.4% slower at 2048. Do not extrapolate the attention-only gains to end-to-end model tokens/second.
+
+## Latest physical T4 validation (2026-11-13)
+
+User-run Colab validation on Tesla T4 / SM75, PyTorch 2.6.0+cu124, CUDA 12.4 and Triton 3.2.0. The general suite reported **107 passed, 1 skipped**. The skipped case is the opt-in CUDA C++ append extension test.
+
+For one-token GQA decode (B=2, Hq=8, Hkv=2, Q=1, visible KV=2048, D=64, FP16):
+- Triton attention-only median: **0.1758 ms**, versus **0.4045 ms** for expanded-KV SDPA (**2.30x**).
+- Fused preallocated append + Triton attention median: **0.1934 ms**, versus **0.4381 ms** for expanded-KV SDPA append + attention (**2.27x**).
+- Fused append + attention reported **10,308.7 batch tokens/s** for batch=2 and one decode position. This is a decode-kernel benchmark, not full-model tokens/s; it excludes projections, MLP, sampling and host-side scheduling.
+- Incremental peak allocation for fused append + attention was **70,656 bytes**, versus **10,489,856 bytes** for the expanded-KV SDPA reference.
+
+The synthetic decoder-block training benchmark (B=2, sequence=512, Hq=8, Hkv=2, D=64, FP32 block parameters with FP16 attention, AdamW) completed after the benchmark import-path fix:
+- Triton median training step: **7.786 ms**, versus **12.416 ms** expanded-KV SDPA (**1.595x**) and **10.441 ms** native GQA SDPA (**1.341x**).
+- Throughput: **131,518 tokens/s** for Triton, versus **82,472** expanded-KV SDPA and **98,075** native GQA SDPA.
+- Maximum absolute forward output error versus expanded-KV SDPA: **6.08e-5**. Losses and parameters remained finite for all three backends.
+- Incremental peak allocation: **58,761,728 bytes** for Triton, **60,334,592** for expanded-KV SDPA and **80,220,672** for native GQA SDPA.
+
+The optional CUDA C++ append test was explicitly attempted but stopped before compilation because the environment did not have `ninja` installed (`RuntimeError: Ninja is required to load C++ extensions`). The environment did report `nvcc` at `/usr/local/cuda/bin/nvcc`. Install the optional `cuda-append` extra and rerun the opt-in test before claiming that the C++ extension is validated.
+
+These are physical-T4 user-reported benchmark results for the measured shapes, not a guarantee for other sequence lengths, models or software stacks. The synthetic decoder block is not a full language model; no end-to-end model speedup is claimed.
 
 ## Physical T4 validation of split-query backward (2026-11-08)
 User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2, D=64, causal:
