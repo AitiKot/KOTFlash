@@ -1,29 +1,47 @@
 # Hardware and software support
 
-## Current custom-kernel target
+## Custom Triton kernels
 
-| Hardware | Compute capability | Custom Triton forward | Status |
+| Hardware | Compute capability | Custom Triton backend | Evidence / status |
 |---|---:|---|---|
-| NVIDIA Tesla T4 | 7.5 (SM75) | Intended | Target hardware; physical validation still required |
-| Other NVIDIA Turing GPUs | 7.5 (SM75) | Intended | Not yet validated individually |
-| Ampere and newer | 8.0+ | No custom dispatch in this release | Uses PyTorch SDPA fallback |
-| CPU | N/A | No | Uses PyTorch SDPA |
+| NVIDIA Tesla T4 | 7.5 (SM75) | Validated target for the documented stack | Physical T4 suite: 107 passed, 1 skipped (2026-11-13); optional CUDA C++ append integration test: 1 passed separately. Auto-routing remains limited to the exact measured profile |
+| Other NVIDIA Turing GPUs | 7.5 (SM75) | Intended | Not independently validated on every device |
+| Ampere and newer | 8.0+ | Not enabled by this release | Use PyTorch SDPA |
+| CPU | N/A | Not available | Use PyTorch SDPA |
 
-## Software requirements for the experimental path
+## Software requirements
 
-- CUDA-enabled PyTorch installation compatible with the installed NVIDIA driver.
-- Upstream Triton 3.2.x, the last upstream release line with SM75 support.
-- FP16 Q/K/V.
-- Head dimension between 16 and 128.
+The conservative custom-kernel target is:
+- CUDA-enabled PyTorch compatible with the host driver;
+- upstream Triton 3.2.x, or a maintained compatible Turing-enabled build;
+- FP16 Q/K/V tensors;
+- head dimension between 16 and 128.
 
-Upstream Triton 3.3 and later dropped Volta and Turing support. Newer PyTorch installations may bundle a Triton version without SM75 support. Use a separate environment with a compatible PyTorch/Triton pairing or a maintained downstream build; KOTFlash does not rewrite the installed compiler stack.
+Upstream Triton 3.3 and later dropped Volta/Turing support. Newer PyTorch environments may bundle a Triton build that cannot compile for SM75. Use a separate compatible environment rather than blindly downgrading the Triton installation inside an existing PyTorch setup.
+
+## Measured automatic profile
+
+The current `backend="auto"` performance profile is deliberately narrow. It was measured on:
+
+- NVIDIA Tesla T4 / SM75;
+- PyTorch 2.6.0+cu124;
+- CUDA 12.4;
+- Triton 3.2.x;
+- contiguous FP16 Q/K/V;
+- B=2, Hq=8, Hkv=2, D=64, default scale 0.125.
+
+The profile contains five causal self-attention sequence lengths (128, 256, 512, 1024 and 2048) and three non-causal decode shapes: (Sq, Sk) = (1, 2048), (4, 1024) and (16, 4096).
+
+No other shape or software stack should be assumed to use the same winning backend. Unprofiled inputs retain the PyTorch SDPA fallback.
 
 ## Known limitations
 
-- The current kernel uses simple fixed tile defaults (BLOCK_M=32, BLOCK_N=64, 4 warps, 2 stages). They are not claimed to be optimal.
-- Head dimension 72 is padded to 128. It is functionally accepted but may waste work.
-- Custom forward is FP16 only. SDPA fallback supports the dtypes/hardware supported by the installed PyTorch build.
-- Backward is a Python/PyTorch reference implementation and will be much slower than a fused GPU kernel.
-- No dropout, local-window, paged KV-cache or variable-length packed interface yet.
+- The Triton kernels currently support FP16 only.
+- BF16 is not supported by the current Turing custom path.
+- Packed variable-length sequences are not implemented.
+- KOTFlash does not manage or page KV caches.
+- Dropout and local-window attention are not implemented.
+- Performance varies with shapes, clocks, thermal/power state, driver and software versions.
+- No full-model generation or full-model training speedup has been established.
 
-A backend is not considered validated until the test suite runs on the stated physical GPU and the logs are published with the software versions.
+Always run correctness tests and benchmarks on the exact target GPU before relying on a performance profile.

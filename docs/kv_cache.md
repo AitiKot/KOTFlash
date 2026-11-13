@@ -18,9 +18,12 @@ cache = PreallocatedKVCache(
 )
 cache.append(k_prefill, v_prefill)
 
-# After computing one new token's K/V:
-cache.append(k_new, v_new)
-output = cache.attend(q_new, backend="auto")
+# After computing one new token's K/V, append and attend in one API call:
+output = cache.append_and_attend(
+    q_new, k_new, v_new,
+    append_backend="auto",       # torch by default; optional CUDA via env var
+    attention_backend="auto",    # fused Triton on exact measured T4 profile
+)
 ```
 
 `append` validates shape, device, dtype and capacity before writing. The
@@ -29,11 +32,12 @@ by the allocated storage and excludes unused slots. These views can be
 non-contiguous because the allocated cache has a larger capacity than its
 populated prefix. `contiguous_view()` explicitly copies the populated prefix.
 
-The current Triton attention wrapper requires contiguous input and will make
-a contiguous copy when needed. The preallocated class avoids reallocating the
-entire cache with `torch.cat`, but does **not** yet provide zero-copy Triton
-attention. Removing that copy requires kernels that accept the cache's
-strides; that optimization remains experimental and must be measured on T4.
+For the measured SM75 decode layout (B=2, Hq=8, Hkv=2, Q=1, KV=2048, D=64,
+FP16 on PyTorch 2.6.0+cu124 / Triton 3.2.x), `backend="auto"` can use an
+inference-only Split-KV kernel that accepts the cache's padded strides. It
+does not copy the populated K/V prefix into contiguous buffers. The generic
+Triton training/autograd path still makes contiguous copies; other cache
+shapes and software stacks use the conservative fallback until profiled.
 
 ## Convenience functions
 
@@ -53,3 +57,40 @@ The cache is caller-owned, append-only, and not thread-safe. It does not handle
 resetting, paging, eviction, sliding windows, prefix sharing or concurrent
 writes. Allocate one instance per independent request/sequence unless the
 caller provides external synchronization.
+
+
+## Optional one-launch CUDA C++ append
+
+For FP16 CUDA caches, K and V can be written to their preallocated slots by a
+single custom CUDA kernel instead of two PyTorch `copy_` calls:
+
+```python
+cache.append(k_new, v_new, backend="cuda")
+```
+
+The first call JIT-compiles the bundled first-party source with
+`torch.utils.cpp_extension`, so the machine needs a compatible CUDA toolkit
+and `nvcc`. To opt in automatically for all eligible cache appends, set
+`KOTFLASH_ENABLE_CUDA_APPEND=1` before starting Python. The portable default
+is `backend="torch"` (or `"auto"` with the environment variable unset).
+This operator only appends K/V; the attention computation is still performed
+by PyTorch SDPA or the separate Triton decode kernel. The CUDA extension is
+experimental and must be benchmarked on the target GPU.
+
+
+
+## Fused T4 append + decode
+
+For the exact measured T4 profile (B=2, Hq=8, Hkv=2, Q=1, past KV=2047,
+D=64, FP16, PyTorch 2.6.0+cu124 / Triton 3.2.x), the default
+`append_backend="auto"` in `append_and_attend()` uses an inference-only
+fused Split-KV kernel. The launch writes the new K/V slot and computes its
+partial attention result in the same kernel. A second kernel reduces the
+partial outputs. This avoids a separate cache-append launch and avoids
+copying the existing K/V prefix.
+
+To force this experimental path on another eligible SM75 short-query / long
+cache shape, set `append_backend="fused"` and `attention_backend="triton"`.
+It is inference-only, FP16, head_dim 16–64 and requires Triton 3.2.x. It has no
+backward implementation. The default `auto` route is restricted to the exact
+T4 profile above; other shapes use the portable append + attention path.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kotflash"
-version = "0.1.1"
+version = "0.2.0"
 description = "Experimental memory-efficient attention kernels for NVIDIA Turing GPUs"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,9 +22,13 @@ classifiers = [
 triton = ["triton>=3.2,<3.3"]
 t4 = ["triton>=3.2,<3.3"]
 test = ["pytest>=7"]
+cuda-append = ["ninja>=1.11"]
 
 [tool.setuptools.packages.find]
 include = ["kotflash*"]
+
+[tool.setuptools.package-data]
+kotflash = ["csrc/*.cpp", "csrc/*.cu"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
