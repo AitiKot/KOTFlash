@@ -2,6 +2,8 @@
 """Fused, memory-bounded Triton backward kernels for NVIDIA SM75."""
 from __future__ import annotations
 
+from .._planning import check_int32_indexing
+
 try:
     import triton
     import triton.language as tl
@@ -351,6 +353,10 @@ def attention_backward(
     if q.dtype != torch.float16:
         raise TypeError("Triton backward currently supports float16 only")
 
+    # Check flat offsets before allocating contiguous input copies or outputs.
+    check_int32_indexing(
+        q=q.numel(), k=k.numel(), v=v.numel(), grad_out=grad_out.numel()
+    )
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     out = out.contiguous()
     lse = lse.contiguous()
@@ -379,6 +385,8 @@ def attention_backward(
         num_q_tiles = triton.cdiv(sq, block_m)
         num_splits = min(8, triton.cdiv(num_q_tiles, 8))
         q_tiles_per_split = triton.cdiv(num_q_tiles, num_splits)
+        partial_numel = num_splits * bsz * hkv * sk * d
+        check_int32_indexing(dk_part=partial_numel, dv_part=partial_numel)
         dk_part = torch.empty(
             (num_splits, bsz, hkv, sk, d),
             device=q.device, dtype=torch.float32,
