@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from ._planning import check_int32_indexing
 from .kernels.triton_forward import attention_forward, triton_turing_supported
 
 
@@ -176,5 +177,7 @@ def attention(
             "CUDA SM75, FP16 and 16 <= head_dim <= 128"
         )
     if backend == "triton" or (backend == "auto" and can_triton):
+        # Reject unsupported flat offsets before autograd makes contiguous copies.
+        check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
         return _TritonAttention.apply(q, k, v, causal, float(scale))
     return _sdpa(q, k, v, causal=causal, scale=scale)
