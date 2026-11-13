@@ -95,3 +95,20 @@ is `backend="torch"` (or `"auto"` with the environment variable unset).
 This operator only appends K/V; the attention computation is still performed
 by PyTorch SDPA or the separate Triton decode kernel. The CUDA extension is
 experimental and must be benchmarked on the target GPU.
+
+
+## Fused T4 append + decode
+
+For the exact measured T4 profile (B=2, Hq=8, Hkv=2, Q=1, past KV=2047,
+D=64, FP16, PyTorch 2.6.0+cu124 / Triton 3.2.x), the default
+`append_backend="auto"` in `append_and_attend()` uses an inference-only
+fused Split-KV kernel. The launch writes the new K/V slot and computes its
+partial attention result in the same kernel. A second kernel reduces the
+partial outputs. This avoids a separate cache-append launch and avoids
+copying the existing K/V prefix.
+
+To force this experimental path on another eligible SM75 short-query / long
+cache shape, set `append_backend="fused"` and `attention_backend="triton"`.
+It is inference-only, FP16, head_dim 16–64 and requires Triton 3.2.x. It has no
+backward implementation. The default `auto` route is restricted to the exact
+T4 profile above; other shapes use the portable append + attention path.

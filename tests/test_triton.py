@@ -260,3 +260,64 @@ def test_auto_routes_exact_t4_preallocated_cache_decode():
             is_causal=False,
         )
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
+def test_fused_preallocated_append_and_attention_matches_expanded_sdpa():
+    from kotflash.cache import PreallocatedKVCache
+
+    torch.manual_seed(41)
+    cache = PreallocatedKVCache(
+        2, 2, 4096, 64, device="cuda", dtype=torch.float16
+    )
+    past_k = torch.randn(2, 2, 2047, 64, device="cuda", dtype=torch.float16)
+    past_v = torch.randn_like(past_k)
+    new_k = torch.randn(2, 2, 1, 64, device="cuda", dtype=torch.float16)
+    new_v = torch.randn_like(new_k)
+    q = torch.randn(2, 8, 1, 64, device="cuda", dtype=torch.float16)
+    cache.append(past_k, past_v, backend="torch")
+
+    with torch.inference_mode():
+        actual = cache.append_and_attend(
+            q, new_k, new_v,
+            append_backend="fused", attention_backend="triton",
+        )
+        expected = F.scaled_dot_product_attention(
+            q,
+            torch.cat((past_k, new_k), dim=2).repeat_interleave(4, dim=1),
+            torch.cat((past_v, new_v), dim=2).repeat_interleave(4, dim=1),
+            is_causal=False,
+        )
+        torch.cuda.synchronize()
+        saved_k, saved_v = cache.view()
+
+    assert cache.length == 2048
+    torch.testing.assert_close(saved_k[:, :, -1:], new_k)
+    torch.testing.assert_close(saved_v[:, :, -1:], new_v)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
+def test_auto_fused_preallocated_append_matches_expanded_sdpa_on_measured_t4():
+    from kotflash.cache import PreallocatedKVCache
+
+    torch.manual_seed(43)
+    cache = PreallocatedKVCache(
+        2, 2, 4096, 64, device="cuda", dtype=torch.float16
+    )
+    past_k = torch.randn(2, 2, 2047, 64, device="cuda", dtype=torch.float16)
+    past_v = torch.randn_like(past_k)
+    new_k = torch.randn(2, 2, 1, 64, device="cuda", dtype=torch.float16)
+    new_v = torch.randn_like(new_k)
+    q = torch.randn(2, 8, 1, 64, device="cuda", dtype=torch.float16)
+    cache.append(past_k, past_v, backend="torch")
+
+    with torch.inference_mode():
+        actual = cache.append_and_attend(q, new_k, new_v, append_backend="auto")
+        expected = F.scaled_dot_product_attention(
+            q,
+            torch.cat((past_k, new_k), dim=2).repeat_interleave(4, dim=1),
+            torch.cat((past_v, new_v), dim=2).repeat_interleave(4, dim=1),
+            is_causal=False,
+        )
+    assert cache.length == 2048
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)

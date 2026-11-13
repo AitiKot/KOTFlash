@@ -92,7 +92,10 @@ python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 8 --k
 The package includes `kotflash.cache.append_kv_cache`, `decode_step` and
 `PreallocatedKVCache`. The fixed-capacity cache can append and attend without
 `torch.cat`; its inference-only SM75 path accepts padded/strided K/V prefixes.
-The optional first-party CUDA C++ extension copies K and V in one kernel launch:
+On the exact measured T4 decode profile, `append_and_attend()` also fuses the
+K/V cache write with Split-KV partial attention in one Triton launch; a second
+launch reduces partial results. The optional first-party CUDA C++ extension
+remains available for standalone K/V appends:
 
 ```bash
 KOTFLASH_ENABLE_CUDA_APPEND=1 python your_decode_script.py
@@ -106,11 +109,12 @@ writes; attention remains the separate Triton kernel. See
 [docs/kv_cache.md](docs/kv_cache.md) for the API, benchmark and limitations.
 
 The fixed-capacity cache avoids reallocating the K/V history with
-`torch.cat`. For supported short-query inference shapes on SM75, the new
-stride-aware Split-KV kernel reads the padded cache prefix directly and does
-not materialize contiguous K/V copies. Other layouts and training-with-grad
-continue to use the conservative contiguous/autograd path. The path is
-experimental until the new physical-T4 benchmark has been rerun.
+`torch.cat`. For supported short-query inference shapes on SM75, the stride-aware
+Split-KV kernel reads padded cache prefixes directly. The exact measured T4
+append/decode profile fuses the new K/V write with partial attention in one
+launch, followed by a partial-result reduction. Other layouts and
+training-with-grad continue to use the conservative append/autograd path.
+The new paths are experimental until fresh physical-T4 results are reviewed.
 
 ## Quick start
 

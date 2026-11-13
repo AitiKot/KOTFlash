@@ -197,13 +197,18 @@ class PreallocatedKVCache:
         append_backend: str = "auto",
         attention_backend: str = "auto",
     ) -> torch.Tensor:
-        """Append one token and attend without concatenating/copying the cache prefix.
+        """Append one token and attend without copying the existing cache prefix.
 
-        For inference on supported SM75 T4 shapes, attention reads the
-        preallocated cache view directly using its tensor strides.
+        On the exact measured T4 profile, append_backend="auto" fuses the new
+        K/V write with Split-KV partial attention in one kernel launch, followed
+        by a partial-result reduction. Other supported inference shapes use
+        direct stride-aware attention after a normal cache append. The fused
+        path is inference-only and has no backward implementation.
         """
         if attention_backend not in {"auto", "triton", "sdpa"}:
             raise ValueError("attention backend must be one of: auto, triton or sdpa")
+        if append_backend not in {"auto", "torch", "cuda", "fused"}:
+            raise ValueError("append backend must be one of: auto, torch, cuda or fused")
         if not isinstance(q_new, torch.Tensor) or q_new.ndim != 4 or q_new.shape[2] != 1:
             raise ValueError("q_new must use [B, Hq, 1, D] layout")
         if q_new.shape[0] != self.k.shape[0] or q_new.shape[-1] != self.k.shape[-1]:
@@ -213,7 +218,62 @@ class PreallocatedKVCache:
         if q_new.device != self.k.device or q_new.dtype != self.k.dtype:
             raise ValueError("Query device and dtype must match the cache")
 
-        self.append(new_k, new_v, backend=append_backend)
+        _validate_kv_tensors(self.k, self.v, new_k, new_v)
+        if new_k.shape[2] != 1:
+            raise ValueError("append_and_attend accepts exactly one new K/V token")
+        end = self.length + 1
+        if end > self.max_len:
+            raise ValueError(
+                f"KV cache full: {self.length} + 1 tokens exceeds max_len={self.max_len}"
+            )
+
+        # On the exact measured T4 decode profile, auto combines the append
+        # write with Split-KV partial attention in one Triton launch. A second
+        # kernel merges partial results. Grad-enabled calls keep the portable
+        # append + attention path; the fused inference kernel has no backward.
+        use_fused = append_backend == "fused"
+        if append_backend == "auto" and attention_backend in {"auto", "triton"}:
+            from .attention import _is_measured_t4_runtime
+            from .kernels.triton_decode import strided_decode_supported
+            device_index = q_new.device.index
+            if device_index is None and q_new.is_cuda:
+                device_index = torch.cuda.current_device()
+            use_fused = (
+                q_new.is_cuda
+                and tuple(q_new.shape) == (2, 8, 1, 64)
+                and tuple(new_k.shape) == (2, 2, 1, 64)
+                and self.length == 2047
+                and strided_decode_supported(q_new, self.k, self.v)
+                and _is_measured_t4_runtime(device_index)
+                and os.environ.get("KOTFLASH_ENABLE_CUDA_APPEND") != "1"
+            )
+
+        has_grad_inputs = torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q_new, new_k, new_v)
+        )
+        if append_backend == "auto" and has_grad_inputs:
+            use_fused = False
+        if use_fused:
+            if attention_backend == "sdpa":
+                raise ValueError("append_backend='fused' requires attention_backend='auto' or 'triton'")
+            if has_grad_inputs:
+                raise RuntimeError("append_backend='fused' is inference-only; disable gradients")
+            from .kernels.triton_forward import triton_turing_supported
+            from .kernels.triton_decode import attention_forward_strided_append
+            if not triton_turing_supported():
+                raise RuntimeError("fused append/decode requires Turing-compatible Triton 3.2.x")
+            output = attention_forward_strided_append(
+                q_new, self.k, self.v, new_k, new_v,
+                past_length=self.length,
+                scale=1.0 / (self.k.shape[-1] ** 0.5),
+            )
+            self.length = end
+            return output
+
+        self.append(
+            new_k, new_v,
+            backend="torch" if append_backend == "fused" else append_backend,
+        )
         return self.attend(q_new, backend=attention_backend)
 
     def attend(self, q_new: torch.Tensor, *, backend: str = "auto") -> torch.Tensor:

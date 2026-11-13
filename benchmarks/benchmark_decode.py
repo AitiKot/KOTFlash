@@ -87,7 +87,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
-        "--append-backend", choices=("auto", "torch", "cuda"), default="auto",
+        "--append-backend", choices=("auto", "torch", "cuda", "fused"), default="auto",
         help="append implementation for the preallocated-cache benchmark",
     )
     parser.add_argument("--output", type=Path, default=None)
@@ -180,13 +180,16 @@ def main() -> None:
     def preallocated_attention(backend):
         return prefilled_cache.attend(q, backend=backend)
 
-    def preallocated_decode(backend):
+    def preallocated_decode(backend, append_backend=None):
         # Reset only the logical prefix; the last slot is overwritten on every
         # iteration. No allocation or copy of the existing KV history occurs.
         decode_cache.length = args.kv_seq - 1
+        selected_append_backend = (
+            args.append_backend if append_backend is None else append_backend
+        )
         return decode_cache.append_and_attend(
             q, new_k, new_v,
-            append_backend=args.append_backend,
+            append_backend=selected_append_backend,
             attention_backend=backend,
         )
 
@@ -196,13 +199,17 @@ def main() -> None:
             "triton": (triton_attention, decode_triton),
             "auto": (auto_attention, decode_auto),
             "pytorch_expanded_sdpa": (expanded_sdpa, decode_expanded),
-            "preallocated_triton": (
+            "preallocated_triton_separate_append": (
                 lambda: preallocated_attention("triton"),
-                lambda: preallocated_decode("triton"),
+                lambda: preallocated_decode("triton", "torch"),
             ),
             "preallocated_auto": (
                 lambda: preallocated_attention("auto"),
                 lambda: preallocated_decode("auto"),
+            ),
+            "preallocated_fused_append": (
+                lambda: preallocated_attention("triton"),
+                lambda: preallocated_decode("triton", "fused"),
             ),
         }
         correctness = {}
@@ -266,7 +273,8 @@ def main() -> None:
             "tokens_per_second is batch throughput for one decode position per batch "
             "and excludes model projections, MLP, sampling and host-side scheduling. "
             "legacy append_plus_attention variants include torch.cat; preallocated "
-            "variants append into fixed storage. GPU event time and synchronized "
+            "variants use fixed storage, and fused_append combines cache writes with "
+            "the Split-KV partial kernel. GPU event time and synchronized "
             "wall-clock time are reported separately."
         ),
     }
