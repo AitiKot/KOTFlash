@@ -12,6 +12,10 @@ import torch.nn.functional as F
 from ._planning import check_int32_indexing, t4_profile_for_shapes
 from .kernels.triton_forward import attention_forward, triton_turing_supported
 from .kernels.triton_backward import attention_backward
+from .kernels.triton_decode import (
+    attention_forward_strided_decode,
+    strided_decode_supported,
+)
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -100,6 +104,18 @@ def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
         scale=scale,
         contiguous=q.is_contiguous() and k.is_contiguous() and v.is_contiguous(),
     )
+
+def _t4_auto_strided_decode_profile(q, k, v, *, causal: bool, scale: float) -> bool:
+    """Exact measured-shape gate for direct reads from a padded T4 KV cache."""
+    if causal or not math.isclose(scale, 0.125, rel_tol=0.0, abs_tol=1e-12):
+        return False
+    if tuple(q.shape) != (2, 8, 1, 64) or tuple(k.shape) != (2, 2, 2048, 64):
+        return False
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _is_measured_t4_runtime(device_index) and strided_decode_supported(q, k, v)
+
 
 def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
     kwargs = _sdpa_kwargs(q, causal=causal, scale=scale)
@@ -228,7 +244,9 @@ def attention(
     3.2.x for B=2/Hq=8/Hkv=2/D=64 causal self-attention at sequence
     lengths 128..2048. The same stack has a separate non-causal decode
     profile for (Sq, Sk)=(1,2048), (4,1024), and (16,4096), routing each
-    to its measured winner. All other stacks and shapes keep SDPA fallback.
+    to its measured winner. A stride-aware inference-only path additionally
+    handles padded preallocated KV views for the exact (2,8,1,64)/(2,2,2048,64)
+    T4 decode profile. All other stacks and shapes keep SDPA fallback.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
@@ -244,6 +262,26 @@ def attention(
             raise ValueError("scale must be finite")
     if backend not in {"auto", "triton", "sdpa"}:
         raise ValueError("backend must be one of: auto, triton, sdpa")
+
+    # Preallocated decode caches expose a strided prefix view. In inference,
+    # read those buffers directly instead of materializing full contiguous K/V
+    # copies. The auto route is deliberately limited to the exact measured
+    # T4 shape; explicit backend="triton" enables the same kernel for other
+    # supported short-query/long-cache SM75 shapes.
+    if backend in {"auto", "triton"} and strided_decode_supported(q, k, v):
+        needs_grad = torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k, v)
+        )
+        if not needs_grad:
+            use_strided_decode = (
+                backend == "triton"
+                or _t4_auto_strided_decode_profile(
+                    q, k, v, causal=causal, scale=float(scale)
+                )
+            )
+            if use_strided_decode and not causal:
+                check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
+                return attention_forward_strided_decode(q, k, v, scale=float(scale))
 
     if backend == "triton":
         capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)

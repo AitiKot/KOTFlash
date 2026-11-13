@@ -19,7 +19,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Physical T4 validation | Historical user-reported split-KV suite **52/52 passed**; newer auto-routing/chunk-edge tests remain unverified on T4 |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
-| Caller-managed KV cache | Append helpers and fixed-capacity storage; no paging, eviction or zero-copy Triton access |
+| Caller-managed KV cache | Fixed-capacity storage, inference-only stride-aware T4 decode and optional CUDA C++ append (experimental) |
 | Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64) |
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
@@ -87,16 +87,30 @@ Benchmark this decode case on a physical T4:
 python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 8 --kv-heads 2 --seq 1 --kv-seq 2048 --head-dim 64 --warmup 20 --iterations 50 --repeats 5
 ```
 
-## Caller-managed KV cache
+## Caller-managed KV cache and optional CUDA append
 
 The package includes `kotflash.cache.append_kv_cache`, `decode_step` and
-`PreallocatedKVCache` for caller-managed incremental decoding. See
-[docs/kv_cache.md](docs/kv_cache.md) for the API and limitations.
+`PreallocatedKVCache`. The fixed-capacity cache can append and attend without
+`torch.cat`; its inference-only SM75 path accepts padded/strided K/V prefixes.
+The optional first-party CUDA C++ extension copies K and V in one kernel launch:
 
-The fixed-capacity cache avoids reallocating the entire K/V history with
-`torch.cat`, but its populated prefix can be strided. The current Triton
-wrapper still makes contiguous copies before kernel launch, so this is not
-zero-copy attention and no decode speedup is claimed.
+```bash
+KOTFLASH_ENABLE_CUDA_APPEND=1 python your_decode_script.py
+```
+
+This JIT-builds the extension on first use and therefore requires a compatible
+local CUDA toolkit with `nvcc`. To force it for one append, pass
+`append_backend="cuda"`; use `append_backend="torch"` to stay portable.
+The CUDA append operator currently supports FP16 and only performs cache
+writes; attention remains the separate Triton kernel. See
+[docs/kv_cache.md](docs/kv_cache.md) for the API, benchmark and limitations.
+
+The fixed-capacity cache avoids reallocating the K/V history with
+`torch.cat`. For supported short-query inference shapes on SM75, the new
+stride-aware Split-KV kernel reads the padded cache prefix directly and does
+not materialize contiguous K/V copies. Other layouts and training-with-grad
+continue to use the conservative contiguous/autograd path. The path is
+experimental until the new physical-T4 benchmark has been rerun.
 
 ## Quick start
 
@@ -137,7 +151,7 @@ attention(q, k, v, *, causal=False, scale=None, backend='auto')
 - `scale=None` uses `1 / sqrt(D)`
 - `backend`: `auto`, `triton` or `sdpa`
 
-The experimental Triton path currently requires CUDA SM75, FP16, upstream Triton 3.2.x, and `16 <= D <= 128`. Non-contiguous inputs are copied to contiguous buffers before the custom kernel. `auto` uses narrow T4 profiles only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes: causal training attention at Sq=Sk 128..2048, plus three non-causal decode cases described above. Every other shape or software stack falls back to PyTorch SDPA.
+The experimental Triton path currently requires CUDA SM75, FP16 and upstream Triton 3.2.x. General non-contiguous tensors are copied to contiguous buffers; the exception is the inference-only, stride-aware preallocated-cache decode kernel for short queries over long KV prefixes. `auto` uses narrow T4 profiles only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes. The new strided-cache route is still experimental pending a fresh physical-T4 run. Other shapes and software stacks fall back to PyTorch SDPA.
 
 ## Tests and benchmark
 
@@ -218,7 +232,7 @@ User-run on Tesla T4 / SM75, PyTorch 2.6.0+cu124, Triton 3.2.0, B=2, Hq=8, Hkv=2
 These are user-reported single-run results for a synthetic one-block training benchmark, not a full-model guarantee. The long-sequence split path is now correctness-tested on T4; further tuning is needed to turn its attention-level gain into a consistent whole-block training speedup.
 
 ## Automatic T4 backend profile
-`backend="auto"` uses deliberately narrow profiles measured on **Tesla T4 / SM75**, PyTorch **2.6.0+cu124** and Triton **3.2.x**. For contiguous FP16 causal self-attention with B=2, Hq=8, Hkv=2, D=64, default scale 0.125 and Sq=Sk in {128, 256, 512, 1024, 2048}, it uses expanded-KV SDPA at 128–512 and fused Triton at 1024–2048. For non-causal decode on the same stack and batch/head/dimension profile, it has three exact measured cases: (Sq,Sk)=(1,2048) selects Triton, (4,1024) selects expanded-KV SDPA, and (16,4096) selects Triton. GPU tests assert both the selected route and numerical output. Other shapes, devices, PyTorch versions, CUDA versions and non-contiguous inputs retain the conservative PyTorch SDPA fallback. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
+`backend="auto"` uses deliberately narrow profiles measured on **Tesla T4 / SM75**, PyTorch **2.6.0+cu124** and Triton **3.2.x**. For contiguous FP16 causal self-attention with B=2, Hq=8, Hkv=2, D=64, default scale 0.125 and Sq=Sk in {128, 256, 512, 1024, 2048}, it uses expanded-KV SDPA at 128–512 and fused Triton at 1024–2048. For non-causal decode on the same stack and batch/head/dimension profile, it has three exact measured cases: (Sq,Sk)=(1,2048) selects Triton, (4,1024) selects expanded-KV SDPA, and (16,4096) selects Triton. GPU tests assert both the selected route and numerical output. Other shapes, devices, PyTorch versions and CUDA versions retain the conservative PyTorch SDPA fallback. Non-contiguous inputs also fall back except for the exact padded preallocated-cache inference route. This is not a universal autotuner; explicit `backend="triton"` and `backend="sdpa"` remain available. Re-measure the profile when changing the software stack.
 
 ## Architecture notes
 
@@ -247,8 +261,10 @@ These are user-reported single-run results for a synthetic one-block training be
 - [ ] Profile and tune the split-dot path on T4
 - [ ] Variable-length packed sequences
 - [x] Experimental split-KV decode for short queries with long caller-managed K/V context
-- [x] Caller-managed append and fixed-capacity KV-cache helpers (no zero-copy guarantee)
-- [ ] Zero-copy strided KV access, paging, eviction and local-window/dropout variants
+- [x] Caller-managed append and fixed-capacity KV-cache helpers
+- [ ] Validate stride-aware, inference-only zero-copy KV decode on physical T4
+- [ ] Paged cache, eviction and local-window/dropout variants
+- [ ] Validate optional CUDA C++ single-launch K/V append build and speed on T4
 - [ ] More PyTorch / Triton compatibility checks
 
 ## Related work and dependencies

@@ -73,3 +73,25 @@ def test_preallocated_cache_attention_matches_manual_sdpa():
         q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1), is_causal=False
     )
     torch.testing.assert_close(out, expected)
+
+
+def test_preallocated_cache_append_and_attend_matches_manual_sdpa():
+    torch.manual_seed(21)
+    cache = PreallocatedKVCache(1, 2, 16, 16, device="cpu", dtype=torch.float32)
+    past_k = torch.randn(1, 2, 5, 16)
+    past_v = torch.randn_like(past_k)
+    new_k = torch.randn(1, 2, 1, 16)
+    new_v = torch.randn_like(new_k)
+    q = torch.randn(1, 4, 1, 16)
+    cache.append(past_k, past_v)
+    actual = cache.append_and_attend(
+        q, new_k, new_v, append_backend="torch", attention_backend="sdpa"
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        torch.cat((past_k, new_k), dim=2).repeat_interleave(2, dim=1),
+        torch.cat((past_v, new_v), dim=2).repeat_interleave(2, dim=1),
+        is_causal=False,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert cache.length == 6

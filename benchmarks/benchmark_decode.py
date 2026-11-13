@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -22,7 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 import torch
 import torch.nn.functional as F
 
-from kotflash.cache import append_kv_cache
+from kotflash.cache import append_kv_cache, PreallocatedKVCache
 from kotflash import attention, triton_turing_supported
 
 
@@ -85,6 +86,10 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--append-backend", choices=("auto", "torch", "cuda"), default="auto",
+        help="append implementation for the preallocated-cache benchmark",
+    )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -121,6 +126,22 @@ def main() -> None:
     visible_k, visible_v = append_kv_cache(past_k, past_v, new_k, new_v)
     groups = args.q_heads // args.kv_heads
 
+    # Keep unused capacity after the visible prefix so the views are genuinely
+    # strided. This is the path that previously incurred full-prefix contiguous
+    # copies inside the Triton autograd wrapper.
+    cache_capacity = max(args.kv_seq * 2, args.kv_seq + 16)
+    prefilled_cache = PreallocatedKVCache(
+        args.batch, args.kv_heads, cache_capacity, args.head_dim,
+        device=device, dtype=dtype,
+    )
+    prefilled_cache.append(visible_k, visible_v, backend="torch")
+
+    decode_cache = PreallocatedKVCache(
+        args.batch, args.kv_heads, cache_capacity, args.head_dim,
+        device=device, dtype=dtype,
+    )
+    decode_cache.append(past_k, past_v, backend="torch")
+
     def expanded_sdpa():
         return F.scaled_dot_product_attention(
             q,
@@ -156,12 +177,33 @@ def main() -> None:
         k, v = append_kv_cache(past_k, past_v, new_k, new_v)
         return attention(q, k, v, causal=False, backend="auto")
 
+    def preallocated_attention(backend):
+        return prefilled_cache.attend(q, backend=backend)
+
+    def preallocated_decode(backend):
+        # Reset only the logical prefix; the last slot is overwritten on every
+        # iteration. No allocation or copy of the existing KV history occurs.
+        decode_cache.length = args.kv_seq - 1
+        return decode_cache.append_and_attend(
+            q, new_k, new_v,
+            append_backend=args.append_backend,
+            attention_backend=backend,
+        )
+
     with torch.inference_mode():
         reference = expanded_sdpa()
         candidates = {
             "triton": (triton_attention, decode_triton),
             "auto": (auto_attention, decode_auto),
             "pytorch_expanded_sdpa": (expanded_sdpa, decode_expanded),
+            "preallocated_triton": (
+                lambda: preallocated_attention("triton"),
+                lambda: preallocated_decode("triton"),
+            ),
+            "preallocated_auto": (
+                lambda: preallocated_attention("auto"),
+                lambda: preallocated_decode("auto"),
+            ),
         }
         correctness = {}
         for name, (attention_fn, _) in candidates.items():
@@ -205,6 +247,13 @@ def main() -> None:
         "warmup": args.warmup,
         "iterations_per_repeat": args.iterations,
         "repeats": args.repeats,
+        "append_backend": args.append_backend,
+        "cuda_append_extension_requested": (
+            args.append_backend == "cuda"
+            or os.environ.get("KOTFLASH_ENABLE_CUDA_APPEND") == "1"
+        ),
+        "preallocated_cache_capacity": cache_capacity,
+        "preallocated_cache_layout": "strided prefix view; unused capacity follows the visible prefix",
         "cache_append_only": measure(
             append_only,
             warmup=args.warmup,
@@ -216,7 +265,9 @@ def main() -> None:
         "interpretation": (
             "tokens_per_second is batch throughput for one decode position per batch "
             "and excludes model projections, MLP, sampling and host-side scheduling. "
-            "append_plus_attention includes torch.cat cache-update cost. GPU event time and synchronized wall-clock time are reported separately."
+            "legacy append_plus_attention variants include torch.cat; preallocated "
+            "variants append into fixed storage. GPU event time and synchronized "
+            "wall-clock time are reported separately."
         ),
     }
 

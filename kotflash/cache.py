@@ -5,6 +5,7 @@ These helpers do not implement paging, eviction, batching or model projections.
 """
 from __future__ import annotations
 
+import os
 from typing import Tuple, Union
 
 import torch
@@ -91,9 +92,12 @@ class PreallocatedKVCache:
     """Fixed-capacity K/V storage with append-only writes.
 
     view() returns storage-backed prefix views, which may be non-contiguous.
-    The current Triton attention wrapper makes contiguous inputs before launch;
-    therefore this class avoids torch.cat reallocation but is not zero-copy
-    end-to-end. contiguous_view() explicitly copies the populated prefix.
+    The SM75 inference decode kernel can read supported padded prefixes
+    directly. Training/autograd and unprofiled shapes retain portable fallback
+    paths. contiguous_view() explicitly copies the populated prefix.
+
+    append() defaults to portable PyTorch copies. An optional JIT-built
+    CUDA C++ operator can combine K/V writes into one kernel launch.
 
     This class is not thread-safe and does not implement paging or eviction.
     """
@@ -117,8 +121,15 @@ class PreallocatedKVCache:
         self.max_len = max_len
         self.length = 0
 
-    def append(self, new_k: torch.Tensor, new_v: torch.Tensor) -> None:
-        """Append one or more positions after validating the complete write."""
+    def append(
+        self, new_k: torch.Tensor, new_v: torch.Tensor, *, backend: str = "auto"
+    ) -> None:
+        """Append positions after validation.
+
+        backend="torch" uses portable tensor copy operations. backend="cuda"
+        forces the optional FP16 CUDA C++ extension. backend="auto" uses that
+        extension only when KOTFLASH_ENABLE_CUDA_APPEND=1 is set.
+        """
         if not isinstance(new_k, torch.Tensor) or not isinstance(new_v, torch.Tensor):
             raise TypeError("new_k and new_v must be torch.Tensor instances")
         if new_k.ndim != 4 or new_v.ndim != 4:
@@ -138,15 +149,32 @@ class PreallocatedKVCache:
         if new_k.dtype != self.k.dtype or new_v.dtype != self.v.dtype:
             raise ValueError("new K/V dtype must match the cache dtype")
 
+        if backend not in {"auto", "torch", "cuda"}:
+            raise ValueError("append backend must be one of: auto, torch or cuda")
         end = self.length + new_k.shape[2]
         if end > self.max_len:
             raise ValueError(
                 f"KV cache full: {self.length} + {new_k.shape[2]} tokens "
                 f"exceeds max_len={self.max_len}"
             )
-        # All user-facing validation is complete before either buffer is written.
-        self.k[:, :, self.length:end].copy_(new_k)
-        self.v[:, :, self.length:end].copy_(new_v)
+
+        # The optional C++/CUDA operator copies K and V in a single launch.
+        # It is opt-in because compiling a CUDA extension requires a working
+        # local CUDA toolkit (including nvcc). The PyTorch path stays portable.
+        use_cuda = backend == "cuda" or (
+            backend == "auto"
+            and os.environ.get("KOTFLASH_ENABLE_CUDA_APPEND") == "1"
+            and self.k.is_cuda
+            and self.k.dtype == torch.float16
+        )
+        if use_cuda:
+            from ._cuda_append import append_kv_cuda
+
+            append_kv_cuda(self.k, self.v, new_k, new_v, self.length)
+        else:
+            # All user-facing validation is complete before either buffer is written.
+            self.k[:, :, self.length:end].copy_(new_k)
+            self.v[:, :, self.length:end].copy_(new_v)
         self.length = end
 
     def view(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -159,6 +187,34 @@ class PreallocatedKVCache:
         """Return contiguous copies of only the populated cache prefix."""
         k, v = self.view()
         return k.contiguous(), v.contiguous()
+
+    def append_and_attend(
+        self,
+        q_new: torch.Tensor,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+        *,
+        append_backend: str = "auto",
+        attention_backend: str = "auto",
+    ) -> torch.Tensor:
+        """Append one token and attend without concatenating/copying the cache prefix.
+
+        For inference on supported SM75 T4 shapes, attention reads the
+        preallocated cache view directly using its tensor strides.
+        """
+        if attention_backend not in {"auto", "triton", "sdpa"}:
+            raise ValueError("attention backend must be one of: auto, triton or sdpa")
+        if not isinstance(q_new, torch.Tensor) or q_new.ndim != 4 or q_new.shape[2] != 1:
+            raise ValueError("q_new must use [B, Hq, 1, D] layout")
+        if q_new.shape[0] != self.k.shape[0] or q_new.shape[-1] != self.k.shape[-1]:
+            raise ValueError("Query batch and head dimension must match the cache")
+        if q_new.shape[1] <= 0 or q_new.shape[1] % self.k.shape[1] != 0:
+            raise ValueError("Query heads must be non-zero and divisible by the cache KV-head count")
+        if q_new.device != self.k.device or q_new.dtype != self.k.dtype:
+            raise ValueError("Query device and dtype must match the cache")
+
+        self.append(new_k, new_v, backend=append_backend)
+        return self.attend(q_new, backend=attention_backend)
 
     def attend(self, q_new: torch.Tensor, *, backend: str = "auto") -> torch.Tensor:
         """Attend one newest query token to the currently populated cache."""

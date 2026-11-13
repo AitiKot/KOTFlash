@@ -26,6 +26,9 @@ test = ["pytest>=7"]
 [tool.setuptools.packages.find]
 include = ["kotflash*"]
 
+[tool.setuptools.package-data]
+kotflash = ["csrc/*.cpp", "csrc/*.cu"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

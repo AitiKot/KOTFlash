@@ -207,3 +207,56 @@ def test_triton_backward_matches_sdpa(
     )
     for actual, expected in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1e-2)
+
+
+def test_strided_preallocated_cache_decode_reads_prefix_without_contiguous_copy():
+    from kotflash.cache import PreallocatedKVCache
+
+    torch.manual_seed(29)
+    cache = PreallocatedKVCache(
+        2, 2, 4096, 64, device="cuda", dtype=torch.float16
+    )
+    past_k = torch.randn(2, 2, 2047, 64, device="cuda", dtype=torch.float16)
+    past_v = torch.randn_like(past_k)
+    new_k = torch.randn(2, 2, 1, 64, device="cuda", dtype=torch.float16)
+    new_v = torch.randn_like(new_k)
+    q = torch.randn(2, 8, 1, 64, device="cuda", dtype=torch.float16)
+
+    cache.append(past_k, past_v)
+    with torch.inference_mode():
+        actual = cache.append_and_attend(
+            q, new_k, new_v,
+            append_backend="torch", attention_backend="triton",
+        )
+        k_view, v_view = cache.view()
+        assert not k_view.is_contiguous() and not v_view.is_contiguous()
+        expected = F.scaled_dot_product_attention(
+            q,
+            k_view.contiguous().repeat_interleave(4, dim=1),
+            v_view.contiguous().repeat_interleave(4, dim=1),
+            is_causal=False,
+        )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+
+def test_auto_routes_exact_t4_preallocated_cache_decode():
+    from kotflash.cache import PreallocatedKVCache
+
+    torch.manual_seed(31)
+    cache = PreallocatedKVCache(
+        2, 2, 4096, 64, device="cuda", dtype=torch.float16
+    )
+    k = torch.randn(2, 2, 2048, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+    q = torch.randn(2, 8, 1, 64, device="cuda", dtype=torch.float16)
+    cache.append(k, v)
+    with torch.inference_mode():
+        actual = cache.attend(q, backend="auto")
+        expected = F.scaled_dot_product_attention(
+            q,
+            k.repeat_interleave(4, dim=1),
+            v.repeat_interleave(4, dim=1),
+            is_causal=False,
+        )
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)

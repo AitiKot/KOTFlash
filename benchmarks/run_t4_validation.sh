@@ -58,9 +58,11 @@ python benchmarks/benchmark_attention.py \
   > "$OUT_DIR/attention-decode-q1-kv2048.json"
 
 echo "Append + attention decode benchmark"
+APPEND_BACKEND="${KOTFLASH_T4_APPEND_BACKEND:-auto}"
 python benchmarks/benchmark_decode.py \
   --batch 2 --q-heads 8 --kv-heads 2 --head-dim 64 \
   --kv-seq 2048 --warmup 20 --iterations 50 --repeats 5 \
+  --append-backend "$APPEND_BACKEND" \
   --output "$OUT_DIR/decode-append-attention.json"
 
 echo "Synthetic decoder-block training benchmark"
