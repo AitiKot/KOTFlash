@@ -64,3 +64,18 @@ def test_decode_step_rejects_multi_token_queries_before_appending():
     new = torch.randn(1, 2, 1, 16)
     with pytest.raises(ValueError, match="exactly one new query token"):
         decode_step(q, cache, cache, new, new, backend="sdpa")
+
+
+def test_append_kv_cache_rejects_zero_head_dimension():
+    empty = torch.empty(1, 0, 2, 8)
+    new = torch.empty(1, 0, 1, 8)
+    with pytest.raises(ValueError, match="non-zero"):
+        append_kv_cache(empty, empty, new, new)
+
+
+def test_decode_step_rejects_query_head_count_not_divisible_by_kv_heads():
+    q = torch.randn(1, 3, 1, 16)
+    cache = torch.randn(1, 2, 5, 16)
+    new = torch.randn(1, 2, 1, 16)
+    with pytest.raises(ValueError, match="divisible"):
+        decode_step(q, cache, cache, new, new, backend="sdpa")
