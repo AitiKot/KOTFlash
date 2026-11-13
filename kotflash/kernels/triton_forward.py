@@ -6,6 +6,8 @@ vendor or copy CUDA/Triton kernels from other attention projects.
 """
 from __future__ import annotations
 
+from .._planning import check_int32_indexing
+
 try:
     import triton
     import triton.language as tl
@@ -124,6 +126,8 @@ def attention_forward(q, k, v, *, causal: bool, scale: float, block_m: int = 32,
 
     b, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
+    # Guard 32-bit flat pointer arithmetic before allocating outputs.
+    check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
     out = q.new_empty((b, hq, sq, d))
     lse = q.new_empty((b, hq, sq), dtype=torch.float32)
     block_d = triton.next_power_of_2(d)
