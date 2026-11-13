@@ -15,6 +15,14 @@ import argparse
 import json
 import math
 import statistics
+import sys
+from pathlib import Path
+
+# Make direct execution work from a fresh repository checkout:
+# `python benchmarks/benchmark_decoder_block.py` sets sys.path[0] to benchmarks/.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 from torch import nn
