@@ -14,7 +14,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | MHA / GQA / MQA API | Implemented |
 | Triton online-softmax forward | Experimental; FP16, SM75, Triton 3.2.x, head_dim 16–128 |
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
-| Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
+| Head dimensions 72 and 96 | Split into 64 + tail tiles; numerical forward/backward cases passed the reported T4 suite; broader performance tuning remains |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
 | Physical T4 validation | Latest suite **107 passed, 1 skipped**; stride-aware/fused decode, synthetic decoder block and optional CUDA C++ append integration test validated on T4 |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
@@ -22,7 +22,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Caller-managed KV cache | Fixed-capacity storage; stride-aware/fused inference-only T4 decode and optional CUDA C++ append integration test validated on reported T4 stack |
 | Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64) |
 
-The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
+The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp consumed by the fused Triton backward.
 
 ## Installation
 
@@ -169,7 +169,7 @@ attention(q, k, v, *, causal=False, scale=None, backend='auto')
 - `scale=None` uses `1 / sqrt(D)`
 - `backend`: `auto`, `triton` or `sdpa`
 
-The experimental Triton path currently requires CUDA SM75, FP16 and upstream Triton 3.2.x. General non-contiguous tensors are copied to contiguous buffers; the exception is the inference-only, stride-aware preallocated-cache decode kernel for short queries over long KV prefixes. `auto` uses narrow T4 profiles only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes. The new strided-cache route is still experimental pending a fresh physical-T4 run. Other shapes and software stacks fall back to PyTorch SDPA.
+The experimental Triton path currently requires CUDA SM75, FP16 and upstream Triton 3.2.x. General non-contiguous tensors are copied to contiguous buffers; the exception is the inference-only, stride-aware preallocated-cache decode kernel for short queries over long KV prefixes. `auto` uses narrow T4 profiles only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes. The strided-cache route remains experimental, but its correctness and measured decode path were validated on a physical T4 on 2026-11-13. Other shapes and software stacks fall back to PyTorch SDPA.
 
 ## Tests and benchmark
 
@@ -279,7 +279,7 @@ These are user-reported single-run results for a synthetic one-block training be
 - Head dimensions 65–127 are split into a 64-wide dot plus a padded tail dot, avoiding a single full 128-wide dot for D=72/96.
 - Accumulators and log-sum-exp are FP32; inputs and output are FP16 in the custom path.
 - GQA maps each query head to its corresponding KV head group.
-- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path passed the expanded physical-T4 correctness suite; the current complete branch suite is 48/48 tests, including 1024- and 2048-token GQA/MQA cases. Its measured T4 speed and limitations are recorded above. The earlier batched PyTorch implementation remains available internally as a correctness reference.
+- The experimental fused backward uses Triton kernels for dQ and dK/dV. The original short-sequence dK/dV path assigns one CTA to each KV tile and walks query tiles serially. A new long-sequence path (Sq >= 1024) splits query tiles into independent chunks, writes FP32 partial dK/dV tensors and reduces them in a second kernel. This avoids atomics and increases parallel work on Turing. The split path passed the expanded physical-T4 correctness suite; the current branch suite subsequently reached 107 passed and 1 skipped on a physical T4 (2026-11-13); the opt-in CUDA C++ append integration test was run separately and passed. Its measured T4 speed and limitations are recorded above. The earlier batched PyTorch implementation remains available internally as a correctness reference.
 - The custom kernel currently targets the upstream Triton 3.2 Turing backend. The current experimental launch defaults are BM=64, BN=32, 4 warps and 2 stages, based on the first T4 tile sweep; keep benchmarking new shapes before treating them as universal defaults.
 
 ## Roadmap
@@ -302,7 +302,7 @@ These are user-reported single-run results for a synthetic one-block training be
 - [x] Caller-managed append and fixed-capacity KV-cache helpers
 - [x] Validate stride-aware, inference-only zero-copy KV decode on physical T4 (user-run 2026-11-13)
 - [ ] Paged cache, eviction and local-window/dropout variants
-- [ ] Validate optional CUDA C++ single-launch K/V append build and speed on T4
+- [x] Build and validate optional CUDA C++ single-launch K/V append correctness on physical T4 (2026-11-13); speed remains workload-dependent and is not claimed
 - [ ] More PyTorch / Triton compatibility checks
 
 ## Related work and dependencies
