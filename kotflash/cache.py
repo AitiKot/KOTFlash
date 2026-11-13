@@ -20,6 +20,8 @@ def _validate_kv_tensors(k_cache, v_cache, new_k, new_v) -> None:
         raise ValueError("All K/V tensors must use [B, Hkv, S, D] layout")
     if k_cache.shape != v_cache.shape:
         raise ValueError("K and V cache shapes must match")
+    if k_cache.shape[0] <= 0 or k_cache.shape[1] <= 0 or k_cache.shape[3] <= 0:
+        raise ValueError("K/V cache batch, head count and head dimension must be non-zero")
     if new_k.shape != new_v.shape:
         raise ValueError("New K and V shapes must match")
     if (
@@ -74,8 +76,8 @@ def decode_step(
         raise ValueError("decode_step accepts exactly one new query token")
     if q_new.shape[0] != k_cache.shape[0] or q_new.shape[-1] != k_cache.shape[-1]:
         raise ValueError("Query batch and head dimension must match the KV cache")
-    if q_new.shape[1] % k_cache.shape[1] != 0:
-        raise ValueError("Query heads must be divisible by the cache KV-head count")
+    if q_new.shape[1] <= 0 or q_new.shape[1] % k_cache.shape[1] != 0:
+        raise ValueError("Query heads must be non-zero and divisible by the cache KV-head count")
     if q_new.device != k_cache.device or q_new.dtype != k_cache.dtype:
         raise ValueError("Query device and dtype must match the KV cache")
 
@@ -164,8 +166,8 @@ class PreallocatedKVCache:
             raise ValueError("q_new must use [B, Hq, 1, D] layout")
         if q_new.shape[0] != self.k.shape[0] or q_new.shape[-1] != self.k.shape[-1]:
             raise ValueError("Query batch and head dimension must match the cache")
-        if q_new.shape[1] % self.k.shape[1] != 0:
-            raise ValueError("Query heads must be divisible by the cache KV-head count")
+        if q_new.shape[1] <= 0 or q_new.shape[1] % self.k.shape[1] != 0:
+            raise ValueError("Query heads must be non-zero and divisible by the cache KV-head count")
         if q_new.device != self.k.device or q_new.dtype != self.k.dtype:
             raise ValueError("Query device and dtype must match the cache")
         k, v = self.view()
