@@ -15,6 +15,7 @@ jobs:
       - run: python -m pip install numpy pytest build
       - run: python -m pip install -e .
       - run: python -m compileall -q kotflash benchmarks tests examples
+      - run: bash -n benchmarks/run_t4_validation.sh
       - run: python examples/gqa_kv_cache_decode.py --help
       - run: python benchmarks/benchmark_attention.py --device cpu --batch 1 --q-heads 2 --kv-heads 1 --seq 16 --head-dim 8 --warmup 1 --iterations 2 --repeats 3
       - run: pytest -q
