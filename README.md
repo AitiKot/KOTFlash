@@ -24,6 +24,14 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp consumed by the fused Triton backward.
 
+## Full Tesla T4 validation in Google Colab
+
+A single notebook installs the isolated Python 3.12 / PyTorch 2.6.0+cu124 / Triton 3.2.x environment, runs the full T4 test-and-benchmark script, and optionally tests the CUDA C++ append extension:
+
+[Open KOTFlash T4 Validation in Google Colab](https://colab.research.google.com/github/AitiKot/KOTFlash/blob/main/notebooks/KOTFlash_T4_Validation.ipynb)
+
+Select a Tesla T4 GPU runtime before running the notebook. It intentionally rejects other GPUs so their results are not mislabeled as T4 measurements.
+
 ## Installation
 
 Install a CUDA-enabled PyTorch build that matches your driver/runtime first. KOTFlash does not install, replace or downgrade PyTorch automatically.
