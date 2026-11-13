@@ -5,7 +5,7 @@ These helpers do not implement paging, eviction, batching or model projections.
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 
@@ -105,7 +105,7 @@ class PreallocatedKVCache:
         max_len: int,
         head_dim: int,
         *,
-        device: torch.device | str,
+        device: Union[torch.device, str],
         dtype: torch.dtype,
     ) -> None:
         dims = {"batch": batch, "kv_heads": kv_heads, "max_len": max_len, "head_dim": head_dim}
