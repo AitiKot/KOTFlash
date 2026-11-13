@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
-from ._planning import check_int32_indexing
+from ._planning import check_int32_indexing, t4_profile_for_shapes
 from .kernels.triton_forward import attention_forward, triton_turing_supported
+from .kernels.triton_backward import attention_backward
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -39,10 +41,68 @@ def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise ValueError("Sequence dimensions must be non-zero")
 
 
-def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
+def _sdpa_kwargs(q, *, causal: bool, scale: Optional[float]):
+    """Build SDPA kwargs without overriding PyTorch's default-scale path.
+
+    Passing the mathematically default scale explicitly can change which
+    optimized SDPA kernel PyTorch dispatches. Preserve scale=None whenever
+    the caller requests the standard 1/sqrt(head_dim) scaling.
+    """
     kwargs = {"attn_mask": None, "dropout_p": 0.0, "is_causal": causal}
-    if scale is not None:
+    default_scale = 1.0 / math.sqrt(q.shape[-1])
+    if scale is not None and not math.isclose(
+        scale, default_scale, rel_tol=0.0, abs_tol=1e-12
+    ):
         kwargs["scale"] = scale
+    return kwargs
+
+
+def _sdpa_expanded(q, k, v, *, causal: bool, scale: Optional[float]):
+    """Run SDPA after expanding grouped KV heads (useful on Turing)."""
+    if q.shape[1] != k.shape[1]:
+        repeat = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    kwargs = _sdpa_kwargs(q, causal=causal, scale=scale)
+    return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+
+@lru_cache(maxsize=8)
+def _is_measured_t4_runtime(device_index: int) -> bool:
+    """Cache immutable device/runtime checks outside the attention hot path."""
+    device = torch.device("cuda", device_index)
+    return (
+        torch.cuda.is_available()
+        and triton_turing_supported()
+        and torch.cuda.get_device_capability(device) == (7, 5)
+        and torch.cuda.get_device_name(device) == "Tesla T4"
+        # The timing profile was measured on this exact PyTorch/CUDA stack.
+        # Other versions may choose different SDPA kernels.
+        and torch.__version__.split("+", 1)[0] == "2.6.0"
+        and torch.version.cuda == "12.4"
+    )
+
+
+def _t4_profile_backend(q, k, v, *, causal: bool, scale: float):
+    """Return a backend only for an exact, previously measured T4 shape."""
+    if not q.is_cuda or q.dtype != torch.float16:
+        return None
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if not _is_measured_t4_runtime(device_index):
+        return None
+    return t4_profile_for_shapes(
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        causal=causal,
+        scale=scale,
+        contiguous=q.is_contiguous() and k.is_contiguous() and v.is_contiguous(),
+    )
+
+def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
+    kwargs = _sdpa_kwargs(q, causal=causal, scale=scale)
 
     if q.shape[1] != k.shape[1]:
         try:
@@ -61,13 +121,15 @@ def _sdpa(q, k, v, *, causal: bool, scale: Optional[float]):
 
 def _blockwise_backward(
     q, k, v, out, lse, grad_out, *, causal: bool, scale: float,
-    q_block: int = 32, kv_block: int = 64,
+    q_block: int = 64, kv_block: int = 128,
 ):
-    """Memory-bounded reference backward; recomputes score tiles instead of storing SxS.
+    """Memory-bounded reference backward using batched PyTorch matrix operations.
 
-    This is intentionally a correctness-oriented PyTorch implementation, not a
-    fused high-performance backward kernel. Its Python loops make it slow for
-    long sequences; use it for validation until a native SM75 backward lands.
+    Score/probability tiles are recomputed instead of storing the full SxS
+    attention matrix. Batch and head dimensions are processed together, and
+    grouped KV gradients are reduced back to their shared KV heads. This is
+    substantially less Python-loop overhead than a per-head implementation,
+    but it is still a reference backward, not a fused high-performance kernel.
     """
     bsz, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
@@ -79,35 +141,48 @@ def _blockwise_backward(
     dk = torch.zeros_like(kf)
     dv = torch.zeros_like(vf)
 
-    for b in range(bsz):
-        for h in range(hq):
-            kh = h // group
-            for qs in range(0, sq, q_block):
-                qe = min(qs + q_block, sq)
-                qb = qf[b, h, qs:qe]
-                dob = dof[b, h, qs:qe]
-                lseb = lsef[b, h, qs:qe]
-                delta = (of[b, h, qs:qe] * dob).sum(dim=-1)
-                dq_block = torch.zeros_like(qb)
-                qpos = torch.arange(qs, qe, device=q.device)
-                for ks in range(0, sk, kv_block):
-                    ke = min(ks + kv_block, sk)
-                    kb = kf[b, kh, ks:ke]
-                    vb = vf[b, kh, ks:ke]
-                    scores = torch.matmul(qb, kb.transpose(0, 1)) * scale
-                    kpos = torch.arange(ks, ke, device=q.device)
-                    if causal:
-                        scores = scores.masked_fill(kpos[None, :] > qpos[:, None], float("-inf"))
-                    p = torch.exp(scores - lseb[:, None])
-                    p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
-                    dp = torch.matmul(dob, vb.transpose(0, 1))
-                    ds = p * (dp - delta[:, None])
-                    dq_block.add_(torch.matmul(ds, kb) * scale)
-                    dk[b, kh, ks:ke].add_(torch.matmul(ds.transpose(0, 1), qb) * scale)
-                    dv[b, kh, ks:ke].add_(torch.matmul(p.transpose(0, 1), dob))
-                dq[b, h, qs:qe] = dq_block
-    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
+    for qs in range(0, sq, q_block):
+        qe = min(qs + q_block, sq)
+        qb = qf[:, :, qs:qe, :]
+        dob = dof[:, :, qs:qe, :]
+        lseb = lsef[:, :, qs:qe]
+        delta = (of[:, :, qs:qe, :] * dob).sum(dim=-1)
+        dq_block = torch.zeros_like(qb)
+        qpos = torch.arange(qs, qe, device=q.device)
 
+        for ks in range(0, sk, kv_block):
+            ke = min(ks + kv_block, sk)
+            # Expand only the current KV tile, not the complete KV sequence.
+            kb = kf[:, :, ks:ke, :].repeat_interleave(group, dim=1)
+            vb = vf[:, :, ks:ke, :].repeat_interleave(group, dim=1)
+            scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+            kpos = torch.arange(ks, ke, device=q.device)
+            if causal:
+                scores = scores.masked_fill(
+                    kpos[None, None, None, :] > qpos[None, None, :, None],
+                    float("-inf"),
+                )
+
+            p = torch.exp(scores - lseb[:, :, :, None])
+            p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+            dp = torch.matmul(dob, vb.transpose(-2, -1))
+            ds = p * (dp - delta[:, :, :, None])
+
+            dq_block.add_(torch.matmul(ds, kb) * scale)
+            dk_group = torch.matmul(ds.transpose(-2, -1), qb)
+            dv_group = torch.matmul(p.transpose(-2, -1), dob)
+
+            # Query heads are laid out as contiguous groups for each KV head.
+            dk[:, :, ks:ke, :].add_(
+                dk_group.reshape(bsz, hkv, group, ke - ks, d).sum(dim=2) * scale
+            )
+            dv[:, :, ks:ke, :].add_(
+                dv_group.reshape(bsz, hkv, group, ke - ks, d).sum(dim=2)
+            )
+
+        dq[:, :, qs:qe, :] = dq_block
+
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 class _TritonAttention(torch.autograd.Function):
     @staticmethod
@@ -122,7 +197,7 @@ class _TritonAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         q, k, v, out, lse = ctx.saved_tensors
-        grads = _blockwise_backward(
+        grads = attention_backward(
             q, k, v, out, lse, grad_out.contiguous(),
             causal=ctx.causal, scale=ctx.scale,
         )
@@ -144,9 +219,16 @@ def attention(
     Hq must be divisible by Hkv. The causal mask is upper-left aligned
     (key position <= query position), matching PyTorch SDPA.
 
-    backend is one of auto, triton or sdpa. The Triton forward requires
-    CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128]. Its backward
-    is a slow, blockwise PyTorch reference implementation.
+    backend is one of auto, triton or sdpa. The experimental Triton path
+    requires CUDA SM75, FP16, Triton 3.2.x and head_dim in [16, 128].
+    For non-causal short-query decode (Sq <= 16, Sk >= 1024, D <= 64),
+    Triton uses split-KV forward parallelism; the caller must pass only
+    K/V entries visible to every query. auto has a deliberately narrow
+    training-attention profile measured on PyTorch 2.6.0+cu124 and Triton
+    3.2.x for B=2/Hq=8/Hkv=2/D=64 causal self-attention at sequence
+    lengths 128..2048. The same stack has a separate non-causal decode
+    profile for (Sq, Sk)=(1,2048), (4,1024), and (16,4096), routing each
+    to its measured winner. All other stacks and shapes keep SDPA fallback.
     """
     _validate(q, k, v)
     if not isinstance(causal, bool):
@@ -163,21 +245,30 @@ def attention(
     if backend not in {"auto", "triton", "sdpa"}:
         raise ValueError("backend must be one of: auto, triton, sdpa")
 
-    capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)
-    can_triton = (
-        q.is_cuda
-        and q.dtype == torch.float16
-        and triton_turing_supported()
-        and 16 <= q.shape[-1] <= 128
-        and capability == (7, 5)
-    )
-    if backend == "triton" and not can_triton:
-        raise RuntimeError(
-            "Triton backend requires Triton 3.2.x (or a compatible Turing-enabled build), "
-            "CUDA SM75, FP16 and 16 <= head_dim <= 128"
+    if backend == "triton":
+        capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else (0, 0)
+        can_triton = (
+            q.is_cuda
+            and q.dtype == torch.float16
+            and triton_turing_supported()
+            and 16 <= q.shape[-1] <= 128
+            and capability == (7, 5)
         )
-    if backend == "triton" or (backend == "auto" and can_triton):
-        # Reject unsupported flat offsets before autograd makes contiguous copies.
+        if not can_triton:
+            raise RuntimeError(
+                "Triton backend requires Triton 3.2.x (or a compatible Turing-enabled build), "
+                "CUDA SM75, FP16 and 16 <= head_dim <= 128"
+            )
         check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
         return _TritonAttention.apply(q, k, v, causal, float(scale))
+
+    if backend == "auto":
+        profile = _t4_profile_backend(q, k, v, causal=causal, scale=float(scale))
+        if profile == "triton":
+            check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
+            return _TritonAttention.apply(q, k, v, causal, float(scale))
+        if profile == "sdpa_expanded":
+            return _sdpa_expanded(q, k, v, causal=causal, scale=scale)
+
+    # Conservative fallback for unprofiled devices and shapes.
     return _sdpa(q, k, v, causal=causal, scale=scale)
