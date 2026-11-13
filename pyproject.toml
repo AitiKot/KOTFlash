@@ -22,6 +22,7 @@ classifiers = [
 triton = ["triton>=3.2,<3.3"]
 t4 = ["triton>=3.2,<3.3"]
 test = ["pytest>=7"]
+cuda-append = ["ninja>=1.11"]
 
 [tool.setuptools.packages.find]
 include = ["kotflash*"]
