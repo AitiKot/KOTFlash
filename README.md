@@ -106,12 +106,12 @@ The benchmark compares SDPA, Triton and auto on the same input shape. It reports
 
 ## Caller-managed KV cache
 
-The package includes \`kotflash.cache.append_kv_cache\`, \`decode_step\` and
-\`PreallocatedKVCache\` for caller-managed incremental decoding. See
+The package includes `kotflash.cache.append_kv_cache`, `decode_step` and
+`PreallocatedKVCache` for caller-managed incremental decoding. See
 [docs/kv_cache.md](docs/kv_cache.md) for the API and limitations.
 
 The fixed-capacity cache avoids reallocating the entire K/V history with
-\`torch.cat\`, but its populated prefix can be strided. The current Triton
+`torch.cat`, but its populated prefix can be strided. The current Triton
 wrapper still makes contiguous copies before kernel launch, so this is not
 zero-copy attention and no decode speedup is claimed.
 
