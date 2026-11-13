@@ -4,7 +4,7 @@
 
 | Hardware | Compute capability | Custom Triton backend | Evidence / status |
 |---|---:|---|---|
-| NVIDIA Tesla T4 | 7.5 (SM75) | Intended target | Physical T4 correctness and performance runs have been reported by the maintainer; latest auto-routing additions still require a final full-suite T4 rerun |
+| NVIDIA Tesla T4 | 7.5 (SM75) | Validated target for the documented stack | Physical T4 suite: 107 passed, 1 skipped (2026-11-13); optional CUDA C++ append integration test: 1 passed separately. Auto-routing remains limited to the exact measured profile |
 | Other NVIDIA Turing GPUs | 7.5 (SM75) | Intended | Not independently validated on every device |
 | Ampere and newer | 8.0+ | Not enabled by this release | Use PyTorch SDPA |
 | CPU | N/A | Not available | Use PyTorch SDPA |
