@@ -19,7 +19,7 @@ KOTFlash is an independent, research-stage implementation. The first public mile
 | Physical T4 validation | Not yet completed by the maintainer |
 | Fused SM75 backward | Not implemented |
 | Packed variable-length sequences | Not implemented |
-| Dropout, local window, KV cache | Not implemented |
+| Caller-managed KV cache | Append helpers and fixed-capacity storage; no paging, eviction or zero-copy Triton access |
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
 
@@ -104,6 +104,17 @@ python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 16 --
 
 The benchmark compares SDPA, Triton and auto on the same input shape. It reports forward latency, forward+backward latency, incremental peak allocated memory, and maximum absolute error. Record the GPU model, driver, CUDA runtime, PyTorch and Triton versions with any published result. Benchmark results from other GPUs are not T4 results.
 
+## Caller-managed KV cache
+
+The package includes \`kotflash.cache.append_kv_cache\`, \`decode_step\` and
+\`PreallocatedKVCache\` for caller-managed incremental decoding. See
+[docs/kv_cache.md](docs/kv_cache.md) for the API and limitations.
+
+The fixed-capacity cache avoids reallocating the entire K/V history with
+\`torch.cat\`, but its populated prefix can be strided. The current Triton
+wrapper still makes contiguous copies before kernel launch, so this is not
+zero-copy attention and no decode speedup is claimed.
+
 ## Architecture notes
 
 - Forward uses online softmax and a tiled Q × Kᵀ / P × V loop. The full `[Sq, Sk]` attention matrix is never stored.
@@ -124,7 +135,8 @@ The benchmark compares SDPA, Triton and auto on the same input shape. It reports
 - [ ] Tune tile sizes, warps and stages on T4
 - [ ] Optimize head dimension 72 without padding to 128
 - [ ] Variable-length packed sequences
-- [ ] Dropout, local-window attention and KV-cache variants
+- [ ] Zero-copy strided KV-cache access in Triton kernels
+- [ ] Paging, eviction, dropout and local-window attention
 - [ ] More PyTorch / Triton compatibility checks
 
 ## Related work and dependencies
