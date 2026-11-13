@@ -1,29 +1,67 @@
-# KOTFlash design
+# KOTFlash architecture
 
-## Layout
+## Public tensor contract
 
-Public tensors use [B, H, S, D], as in PyTorch scaled_dot_product_attention. The query-head count must be divisible by the KV-head count.
+The public API uses tensors in [B, H, S, D] layout:
 
-## Forward
+- Q: [batch, query_heads, query_length, head_dim]
+- K/V: [batch, kv_heads, key_length, head_dim]
+- query_heads must be divisible by kv_heads.
 
-Each Triton program owns a block of query rows for one batch and query head. It streams over key/value blocks and maintains the online-softmax state (m, l, acc):
+Equal head counts implement MHA. Fewer KV heads implement GQA or MQA.
 
-- m: running row maximum of QK scores
-- l: running normalized exponential sum
-- acc: running weighted value sum
+The public entry point is `kotflash.attention.attention`. It validates inputs and chooses one of three backends:
 
-Only the output and row-wise log-sum-exp are written. The complete quadratic attention matrix is never materialized. The implementation accumulates in FP32 and currently accepts FP16 inputs only.
+- `sdpa`: PyTorch scaled-dot-product attention.
+- `triton`: explicitly requests the experimental SM75 implementation.
+- `auto`: uses only narrowly measured T4 profiles and otherwise falls back to PyTorch SDPA.
 
-## GQA/MQA
+## Triton forward
 
-For Hq/Hkv = G, query head h reads KV head h // G. The backward loops over query heads and accumulates their dK/dV contributions into the corresponding KV head.
+The standard Triton forward assigns a program to a query tile, batch item and query head. It streams over key/value tiles and maintains the online-softmax state:
 
-## Backward
+- m: running row maximum of QK scores;
+- l: running sum of exponentials relative to m;
+- acc: running weighted-value accumulator.
 
-The current backward recomputes each score tile in PyTorch using FP32 intermediates. It is a correctness-first, memory-bounded reference implementation, not a fused performance kernel. Python loops make it slow for long sequences. A future SM75 backward should use dedicated GPU kernels for dQ and dK/dV and avoid races while accumulating shared KV gradients.
+The full [Sq, Sk] attention matrix is not materialized. Accumulators and log-sum-exp values use FP32; the experimental custom path accepts FP16 Q/K/V.
 
-## Turing constraints
+For causal attention, key positions greater than query positions are masked. Complete future K/V tiles are skipped. The mask follows PyTorch's upper-left alignment for unequal query and key lengths.
 
-The initial custom path targets SM75 and FP16. Upstream Triton 3.3 removed Turing support; use upstream Triton 3.2.x or a separately maintained Turing-enabled build. Tile sizes must be benchmarked on a physical T4; do not transfer Ampere/Hopper assumptions blindly.
+For head dimensions between 65 and 127, the forward implementation computes a 64-wide dot plus a padded tail dot. This avoids padding the entire operation to a 128-wide dot for dimensions such as 72 and 96. This path is implemented but still requires broader T4 profiling.
 
-Head dimensions are padded to the next power of two. For example, D=72 is padded to 128, so it is accepted but not yet efficient. Fixed block sizes are starting values, not measured optimal settings.
+## Split-KV decode
+
+For non-causal attention with short queries (Sq <= 16), long K/V context (Sk >= 1024) and D <= 64, the explicit Triton backend can split the K/V sequence across independent programs.
+
+Each split writes:
+- a normalized partial output;
+- a row-wise partial log-sum-exp.
+
+A reduction kernel combines partial outputs using the partial log-sum-exp values as weights. This is mathematically equivalent to a single softmax over the concatenated visible K/V context.
+
+The caller owns cache allocation and lifetime. KOTFlash provides a simple `append_kv_cache` / `decode_step` convenience helper implemented with `torch.cat`, but it does not provide preallocated cache writes, paging or eviction. The caller must pass only keys visible to every query in the supplied Q chunk. For one-token decoding, when the cache includes the current token and contains no future keys, use `causal=False`.
+
+The convenience append helper copies the existing cache and is intended for examples, not high-throughput generation. Production model code should normally append into preallocated storage. The split-KV path is experimental. Its speed depends on query length, cache length, head dimension, GPU and software stack. A measured win for one exact shape must not be generalized to nearby shapes.
+
+## Triton backward
+
+The custom autograd function saves Q/K/V, the forward output and row log-sum-exp. The fused Triton backward computes dQ and dK/dV.
+
+For shorter query sequences, dK/dV work is assigned by KV tile and accumulates contributions from the query tiles. For Sq >= 1024, the implementation splits query tiles into independent chunks, writes FP32 partial dK/dV buffers and reduces those buffers in a second kernel. This increases parallel work without floating-point atomics.
+
+A batched PyTorch blockwise backward helper remains in the source as a reference/testing implementation; it is not the production Triton backward path.
+
+## Runtime constraints
+
+The experimental kernels currently target:
+- CUDA NVIDIA Turing SM75;
+- FP16 Q/K/V;
+- head dimensions 16 through 128;
+- upstream Triton 3.2.x, or a compatible Turing-enabled build.
+
+The automatic performance profile is narrower than the explicit Triton backend. It is tied to the exact T4/PyTorch/CUDA/Triton stack and shapes measured so far. Unprofiled shapes use the conservative SDPA fallback.
+
+## Deliberate non-goals
+
+KOTFlash is an attention library, not a complete inference engine. It currently does not provide paged KV cache management, packed variable-length sequences, dropout, local-window attention, token sampling, model projections or a model-serving runtime.
