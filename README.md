@@ -19,7 +19,8 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Physical T4 validation | Split-KV implementation: user-reported Tesla T4 run **52/52 passed**; new auto-routing tests await rerun |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
-| Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64); no cache manager or paging |
+| Caller-managed KV cache | Append helpers and fixed-capacity storage; no paging, eviction or zero-copy Triton access |
+| Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64) |
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
 
@@ -85,6 +86,17 @@ Benchmark this decode case on a physical T4:
 ```bash
 python benchmarks/benchmark_attention.py --device cuda --batch 2 --q-heads 8 --kv-heads 2 --seq 1 --kv-seq 2048 --head-dim 64 --warmup 20 --iterations 50 --repeats 5
 ```
+
+## Caller-managed KV cache
+
+The package includes `kotflash.cache.append_kv_cache`, `decode_step` and
+`PreallocatedKVCache` for caller-managed incremental decoding. See
+[docs/kv_cache.md](docs/kv_cache.md) for the API and limitations.
+
+The fixed-capacity cache avoids reallocating the entire K/V history with
+`torch.cat`, but its populated prefix can be strided. The current Triton
+wrapper still makes contiguous copies before kernel launch, so this is not
+zero-copy attention and no decode speedup is claimed.
 
 ## Quick start
 
@@ -235,7 +247,8 @@ These are user-reported single-run results for a synthetic one-block training be
 - [ ] Profile and tune the split-dot path on T4
 - [ ] Variable-length packed sequences
 - [x] Experimental split-KV decode for short queries with long caller-managed K/V context
-- [ ] Integrated cache management, paged KV cache and local-window/dropout variants
+- [x] Caller-managed append and fixed-capacity KV-cache helpers (no zero-copy guarantee)
+- [ ] Zero-copy strided KV access, paging, eviction and local-window/dropout variants
 - [ ] More PyTorch / Triton compatibility checks
 
 ## Related work and dependencies
