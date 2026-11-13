@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). It has measured modest gains for selected long self-attention workloads and now includes an experimental split-KV path for autoregressive decode. Full decoder-block and full-model training speedups have not been established.
 
-> **Status: alpha / latest user-reported physical-T4 validation (2026-11-13): 107 passed, 1 skipped** on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0. The stride-aware and fused preallocated decode paths passed numerical checks. The synthetic decoder-block training benchmark measured 1.59x versus expanded-KV SDPA and 1.34x versus native GQA SDPA at batch=2, sequence=512. The optional CUDA C++ append extension remains unvalidated because its JIT build prerequisites were incomplete (Ninja was missing). Full-model generation/training speedup has not been measured.
+> **Status: alpha / latest user-reported physical-T4 validation (2026-11-13): 107 passed, 1 skipped** on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0. The stride-aware and fused preallocated decode paths passed numerical checks. The synthetic decoder-block training benchmark measured 1.59x versus expanded-KV SDPA and 1.34x versus native GQA SDPA at batch=2, sequence=512. The optional CUDA C++ append extension subsequently compiled and passed its opt-in integration test on physical T4 (1 passed). Full-model generation/training speedup has not been measured.
 
 ## What works today
 
@@ -16,10 +16,10 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | Latest user-reported suite **107 passed, 1 skipped**; stride-aware/fused preallocated decode and synthetic decoder-block benchmark validated on T4. Optional CUDA C++ append build still pending |
+| Physical T4 validation | Latest suite **107 passed, 1 skipped**; stride-aware/fused decode, synthetic decoder block and optional CUDA C++ append integration test validated on T4 |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
-| Caller-managed KV cache | Fixed-capacity storage; stride-aware/fused inference-only T4 decode validated; optional CUDA C++ append build remains experimental and unvalidated |
+| Caller-managed KV cache | Fixed-capacity storage; stride-aware/fused inference-only T4 decode and optional CUDA C++ append integration test validated on reported T4 stack |
 | Long-context decode | Experimental split-KV attention for Q lengths 1–16 over caller-supplied visible K/V contexts ≥1024 tokens (D≤64) |
 
 The custom forward does not materialize the full attention matrix. Its online softmax maintains a running maximum, denominator and output accumulator while visiting K/V tiles. It stores the output and row log-sum-exp for the current reference backward.
@@ -128,7 +128,7 @@ Split-KV kernel reads padded cache prefixes directly. The exact measured T4
 append/decode profile fuses the new K/V write with partial attention in one
 launch, followed by a partial-result reduction. Other layouts and
 training-with-grad continue to use the conservative append/autograd path.
-The stride-aware and fused Triton paths were physically validated on Tesla T4 on 2026-11-13; the optional CUDA C++ append build remains experimental until its toolchain-enabled integration test is completed.
+The stride-aware/fused Triton paths and optional CUDA C++ append integration test were physically validated on Tesla T4 on 2026-11-13. The C++ test passed after installing Ninja and compiling with NVCC 13.0 / G++ 13.3.
 
 ## Quick start
 
@@ -255,7 +255,7 @@ The synthetic decoder-block training benchmark (B=2, sequence=512, Hq=8, Hkv=2, 
 - Maximum absolute forward output error versus expanded-KV SDPA: **6.08e-5**. Losses and parameters remained finite for all three backends.
 - Incremental peak allocation: **58,761,728 bytes** for Triton, **60,334,592** for expanded-KV SDPA and **80,220,672** for native GQA SDPA.
 
-The optional CUDA C++ append test was explicitly attempted but stopped before compilation because the environment did not have `ninja` installed (`RuntimeError: Ninja is required to load C++ extensions`). The environment did report `nvcc` at `/usr/local/cuda/bin/nvcc`. Install the optional `cuda-append` extra and rerun the opt-in test before claiming that the C++ extension is validated.
+The optional CUDA C++ append test was rerun after installing the `cuda-append` extra. On the reported physical T4 environment, Ninja 1.13.2, NVCC 13.0 and G++ 13.3 successfully built the extension; `KOTFLASH_TEST_CUDA_APPEND=1 python -m pytest -q tests/test_cuda_append.py` reported **1 passed** in 74.17 seconds. The test verifies that K and V are copied through one extension call. The compiler emitted a `TORCH_CUDA_ARCH_LIST` warning because it was not explicitly set; compilation and the test still succeeded. This validates the tested path on this environment, not every CUDA toolkit/compiler combination.
 
 These are physical-T4 user-reported benchmark results for the measured shapes, not a guarantee for other sequence lengths, models or software stacks. The synthetic decoder block is not a full language model; no end-to-end model speedup is claimed.
 
