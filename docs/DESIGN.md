@@ -28,7 +28,7 @@ The full [Sq, Sk] attention matrix is not materialized. Accumulators and log-sum
 
 For causal attention, key positions greater than query positions are masked. Complete future K/V tiles are skipped. The mask follows PyTorch's upper-left alignment for unequal query and key lengths.
 
-For head dimensions between 65 and 127, the forward implementation computes a 64-wide dot plus a padded tail dot. This avoids padding the entire operation to a 128-wide dot for dimensions such as 72 and 96. This path is implemented but still requires broader T4 profiling.
+For head dimensions between 65 and 127, the forward implementation computes a 64-wide dot plus a padded tail dot. This avoids padding the entire operation to a 128-wide dot for dimensions such as 72 and 96. The head-dimension 72/96 forward and backward correctness cases passed in the reported physical-T4 suite. Performance has not been exhaustively profiled across all D values.
 
 ## Split-KV decode
 
@@ -40,7 +40,7 @@ Each split writes:
 
 A reduction kernel combines partial outputs using the partial log-sum-exp values as weights. This is mathematically equivalent to a single softmax over the concatenated visible K/V context.
 
-The caller owns cache allocation and lifetime. KOTFlash provides a simple `append_kv_cache` / `decode_step` convenience helper implemented with `torch.cat`, but it does not provide preallocated cache writes, paging or eviction. The caller must pass only keys visible to every query in the supplied Q chunk. For one-token decoding, when the cache includes the current token and contains no future keys, use `causal=False`.
+The caller owns cache allocation and lifetime. KOTFlash provides `append_kv_cache` / `decode_step` convenience helpers and a fixed-capacity `PreallocatedKVCache`. Its inference-only SM75 path can read supported padded cache prefixes directly; an exact measured T4 profile also fuses one-token K/V append with Split-KV attention. An optional first-party CUDA C++ extension can append K and V in one launch. Paging, eviction and concurrent request scheduling remain out of scope. The caller must pass only keys visible to every query in the supplied Q chunk. For one-token decoding, when the cache includes the current token and contains no future keys, use `causal=False`.
 
 The convenience append helper copies the existing cache and is intended for examples, not high-throughput generation. Production model code should normally append into preallocated storage. The split-KV path is experimental. Its speed depends on query length, cache length, head dimension, GPU and software stack. A measured win for one exact shape must not be generalized to nearby shapes.
 
