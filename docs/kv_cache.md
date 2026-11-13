@@ -21,8 +21,8 @@ cache.append(k_prefill, v_prefill)
 # After computing one new token's K/V, append and attend in one API call:
 output = cache.append_and_attend(
     q_new, k_new, v_new,
-    append_backend="auto",       # portable torch path by default
-    attention_backend="auto",    # direct strided Triton path for measured T4 decode
+    append_backend="auto",       # torch by default; optional CUDA via env var
+    attention_backend="auto",    # fused Triton on exact measured T4 profile
 )
 ```
 
@@ -77,24 +77,6 @@ This operator only appends K/V; the attention computation is still performed
 by PyTorch SDPA or the separate Triton decode kernel. The CUDA extension is
 experimental and must be benchmarked on the target GPU.
 
-
-## Optional one-launch CUDA C++ append
-
-For FP16 CUDA caches, K and V can be written to their preallocated slots by a
-single custom CUDA kernel instead of two PyTorch `copy_` calls:
-
-```python
-cache.append(k_new, v_new, backend="cuda")
-```
-
-The first call JIT-compiles the bundled first-party source with
-`torch.utils.cpp_extension`, so the machine needs a compatible CUDA toolkit
-and `nvcc`. To opt in automatically for all eligible cache appends, set
-`KOTFLASH_ENABLE_CUDA_APPEND=1` before starting Python. The portable default
-is `backend="torch"` (or `"auto"` with the environment variable unset).
-This operator only appends K/V; the attention computation is still performed
-by PyTorch SDPA or the separate Triton decode kernel. The CUDA extension is
-experimental and must be benchmarked on the target GPU.
 
 
 ## Fused T4 append + decode
