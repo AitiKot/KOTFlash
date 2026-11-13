@@ -300,7 +300,7 @@ These are user-reported single-run results for a synthetic one-block training be
 - [ ] Variable-length packed sequences
 - [x] Experimental split-KV decode for short queries with long caller-managed K/V context
 - [x] Caller-managed append and fixed-capacity KV-cache helpers
-- [ ] Validate stride-aware, inference-only zero-copy KV decode on physical T4
+- [x] Validate stride-aware, inference-only zero-copy KV decode on physical T4 (user-run 2026-11-13)
 - [ ] Paged cache, eviction and local-window/dropout variants
 - [ ] Validate optional CUDA C++ single-launch K/V append build and speed on T4
 - [ ] More PyTorch / Triton compatibility checks
