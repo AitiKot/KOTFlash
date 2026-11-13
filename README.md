@@ -4,7 +4,7 @@
 
 KOTFlash is an independent, research-stage implementation with a PyTorch SDPA path and experimental fused Triton online-softmax forward/backward kernels for NVIDIA Turing (SM75). It has measured modest gains for selected long self-attention workloads and now includes an experimental split-KV path for autoregressive decode. Full decoder-block and full-model training speedups have not been established.
 
-> **Status: alpha / split-KV kernel correctness: 52/52 tests passed on physical Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** Three additional tests for the newly added automatic decode routing still need a physical-T4 rerun. The decode benchmark shows shape-dependent results; see the measured table below. Full-model generation speedup has not been measured.
+> **Status: alpha / user-reported historical T4 validation: 52/52 split-KV correctness tests passed on Tesla T4 / PyTorch 2.6.0+cu124 / Triton 3.2.0.** Follow-up tests for automatic dispatch, chunk-edge cases and newer guards have not yet been rerun on that physical-T4 stack. The decode benchmark shows shape-dependent results; see the measured table below. Full-model generation speedup has not been measured.
 
 ## What works today
 
@@ -16,7 +16,7 @@ KOTFlash is an independent, research-stage implementation with a PyTorch SDPA pa
 | Causal / non-causal | Implemented in both paths; upper-left causal alignment |
 | Head dimensions 72 and 96 | Split into 64 + tail tiles to reduce padding versus a full 128-wide dot; still requires T4 profiling |
 | Backward | Fused Triton dQ/dK/dV; short and long split-query paths passed reported T4 correctness tests |
-| Physical T4 validation | Split-KV implementation: user-reported Tesla T4 run **52/52 passed**; new auto-routing tests await rerun |
+| Physical T4 validation | Historical user-reported split-KV suite **52/52 passed**; newer auto-routing/chunk-edge tests remain unverified on T4 |
 | Fused SM75 backward | Both short-sequence and long split-query dQ/dK/dV paths passed T4 correctness tests; speed remains shape-dependent |
 | Packed variable-length sequences | Not implemented |
 | Caller-managed KV cache | Append helpers and fixed-capacity storage; no paging, eviction or zero-copy Triton access |
