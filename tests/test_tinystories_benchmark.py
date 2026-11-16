@@ -14,8 +14,8 @@ def test_tinystories_benchmark_is_valid_python_and_uses_real_splits():
     source = path.read_text(encoding="utf-8")
     ast.parse(source, filename=str(path))
     assert 'DATASET_NAME = "skeskinen/TinyStories-hf"' in source
-    assert '"train", train_needed' in source
-    assert '"validation", valid_needed' in source
+    assert '"train", train_tokens_needed' in source
+    assert '"validation", validation_tokens_needed' in source
     assert 'backend == "triton"' in source
     assert 'backend == "sdpa_expanded"' in source
     assert '"--seq", type=int, default=4096' in source
