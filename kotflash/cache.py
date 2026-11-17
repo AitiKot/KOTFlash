@@ -177,7 +177,8 @@ class PreallocatedKVCache:
             self.v[:, :, self.length:end].copy_(new_v)
         self.length = end
 
-    def view(self) -> Tuple[torch.Tensor, torch.Tensor]:        """Return storage-backed views of only the populated cache prefix."""
+    def view(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return storage-backed views of only the populated cache prefix."""
         if self.length == 0:
             raise ValueError("KV cache is empty")
         return self.k[:, :, :self.length, :], self.v[:, :, :self.length, :]
