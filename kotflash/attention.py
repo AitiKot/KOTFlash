@@ -268,7 +268,11 @@ def attention(
     # copies. The auto route is deliberately limited to the exact measured
     # T4 shape; explicit backend="triton" enables the same kernel for other
     # supported short-query/long-cache SM75 shapes.
-    if backend in {"auto", "triton"} and strided_decode_supported(q, k, v):
+    if (
+        backend in {"auto", "triton"}
+        and triton_turing_supported()
+        and strided_decode_supported(q, k, v)
+    ):
         needs_grad = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (q, k, v)
         )
