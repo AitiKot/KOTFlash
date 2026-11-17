@@ -243,7 +243,7 @@ if triton is not None:
         PART_O, PART_LSE, O,
         BATCH: tl.constexpr,
         SQ: tl.constexpr, HQ: tl.constexpr,
-        D: tl.constexpr, NUM_SPLITS: tl.constexpr,
+        D: tl.constexpr, NUM_SPLITS,
         SPLIT_PAD: tl.constexpr,
         BM: tl.constexpr, BD: tl.constexpr,
     ):
