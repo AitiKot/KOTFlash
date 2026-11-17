@@ -22,14 +22,36 @@ class SplitKVPlan(NamedTuple):
     blocks_per_split: int
 
 
-def split_kv_plan(sq: int, sk: int, d: int, *, causal: bool) -> Optional[SplitKVPlan]:
-    """Return the conservative short-query/long-cache Split-KV plan, else None."""
+def split_kv_plan(
+    sq: int,
+    sk: int,
+    d: int,
+    *,
+    causal: bool,
+    min_sk: int = 1024,
+    max_d: int = 64,
+) -> Optional[SplitKVPlan]:
+    """Plan Split-KV for short non-causal queries, or return None.
+
+    Defaults preserve the original measured envelope. Callers may explicitly
+    opt into wider decode shapes after validating them on their target GPU.
+    """
     if min(sq, sk, d) <= 0:
         raise ValueError("sq, sk and d must be positive")
-    if causal or sq > 16 or sk < 1024 or d > 64:
+    if min_sk <= 0 or max_d <= 0:
+        raise ValueError("min_sk and max_d must be positive")
+    if causal or sq > 16 or sk < min_sk or d > max_d:
         return None
-    block_n = 64
-    num_splits = min(16, cdiv(sk, 128))
+
+    # Smaller head dimensions and cache lengths use narrower N tiles and
+    # more splits to keep enough independent CTAs in flight on Turing.
+    if sk < 1024 or d > 64:
+        block_n = 32
+        target_min_chunk = 64
+    else:
+        block_n = 64
+        target_min_chunk = 128
+    num_splits = min(16, cdiv(sk, target_min_chunk))
     chunk_n = cdiv(sk, num_splits)
     return SplitKVPlan(16, block_n, num_splits, chunk_n, cdiv(chunk_n, block_n))
 
