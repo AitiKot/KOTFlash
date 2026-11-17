@@ -266,13 +266,12 @@ if triton is not None:
                 other=float("-inf"),
             )
             row_max = tl.max(lse_all, axis=0)
-            weights = tl.exp(lse_all - row_max)
+            safe_max = tl.where(row_max == float("-inf"), 0.0, row_max)
+            weights = tl.exp(lse_all - safe_max)
             weights = tl.where(offs_s < NUM_SPLITS, weights, 0.0)
             denom = tl.sum(weights, axis=0)
-            safe_max = tl.where(denom > 0.0, row_max, 0.0)
             safe_denom = tl.maximum(denom, 1.0)
-            weights = tl.exp(lse_all - safe_max) / safe_denom
-            weights = tl.where(offs_s < NUM_SPLITS, weights, 0.0)
+            weights = weights / safe_denom
 
             part_base = (
                 offs_s * BATCH * HQ * D + (pid_b * HQ + pid_h) * D
