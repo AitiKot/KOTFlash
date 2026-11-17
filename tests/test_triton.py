@@ -321,3 +321,33 @@ def test_auto_fused_preallocated_append_matches_expanded_sdpa_on_measured_t4():
         )
     assert cache.length == 2048
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+@pytest.mark.parametrize(("kv_seq", "head_dim"), [(512, 128), (1024, 128)])
+def test_strided_preallocated_decode_supports_kv512_and_head_dim128(kv_seq, head_dim):
+    """Exercise the expanded Split-KV decode envelope needed by KOT-V2."""
+    from kotflash.cache import PreallocatedKVCache
+
+    torch.manual_seed(53)
+    batch, hq, hkv = 2, 16, 4
+    cache = PreallocatedKVCache(
+        batch, hkv, kv_seq * 2, head_dim,
+        device="cuda", dtype=torch.float16,
+    )
+    past_k = torch.randn(batch, hkv, kv_seq, head_dim, device="cuda", dtype=torch.float16)
+    past_v = torch.randn_like(past_k)
+    q = torch.randn(batch, hq, 1, head_dim, device="cuda", dtype=torch.float16)
+    cache.append(past_k, past_v, backend="torch")
+
+    k_view, v_view = cache.view()
+    assert not k_view.is_contiguous()
+    with torch.inference_mode():
+        actual = attention(q, k_view, v_view, causal=False, backend="triton")
+        expected = F.scaled_dot_product_attention(
+            q,
+            k_view.contiguous().repeat_interleave(hq // hkv, dim=1),
+            v_view.contiguous().repeat_interleave(hq // hkv, dim=1),
+            is_causal=False,
+        )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+\n
