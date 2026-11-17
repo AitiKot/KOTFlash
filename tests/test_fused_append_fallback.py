@@ -11,8 +11,10 @@ from kotflash.cache import PreallocatedKVCache
 @pytest.mark.parametrize(
     ("head_dim", "past_length"),
     [
-        (64, 0),       # Early generation: fused Split-KV is not eligible.
-        (128, 1022),   # KOT-V2 head dimension and just below the split threshold.
+        (64, 0),       # First generated token.
+        (64, 1022),    # Just below the minimum fused prefix length.
+        (128, 1022),   # KOT-V2 D=128, also below the prefix threshold.
+        (128, 1023),   # KOT-V2 D=128 with a long enough prefix: D is the blocker.
     ],
 )
 def test_fused_append_falls_back_for_unsupported_shapes(head_dim, past_length):
