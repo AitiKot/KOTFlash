@@ -263,6 +263,8 @@ class PreallocatedKVCache:
         has_grad_inputs = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (q_new, new_k, new_v)
         )
+        if append_backend == "fused" and has_grad_inputs:
+            raise RuntimeError("append_backend='fused' is inference-only; disable gradients")
         if append_backend == "auto" and has_grad_inputs:
             use_fused = False
         if use_fused:
