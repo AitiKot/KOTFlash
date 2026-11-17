@@ -177,8 +177,7 @@ class PreallocatedKVCache:
             self.v[:, :, self.length:end].copy_(new_v)
         self.length = end
 
-    def view(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return storage-backed views of only the populated cache prefix."""
+    def view(self) -> Tuple[torch.Tensor, torch.Tensor]:        """Return storage-backed views of only the populated cache prefix."""
         if self.length == 0:
             raise ValueError("KV cache is empty")
         return self.k[:, :, :self.length, :], self.v[:, :, :self.length, :]
@@ -227,11 +226,24 @@ class PreallocatedKVCache:
                 f"KV cache full: {self.length} + 1 tokens exceeds max_len={self.max_len}"
             )
 
-        # On the exact measured T4 decode profile, auto combines the append
-        # write with Split-KV partial attention in one Triton launch. A second
-        # kernel merges partial results. Grad-enabled calls keep the portable
-        # append + attention path; the fused inference kernel has no backward.
-        use_fused = append_backend == "fused"
+        # The fused kernel is currently limited to SM75, FP16, D<=64 and
+        # prefixes of at least 1023 tokens. Treat "fused" as best-effort:
+        # unsupported shapes use the portable append + attention path rather
+        # than failing during ordinary early-token generation or D=128 decode.
+        use_fused = False
+        if append_backend == "fused":
+            from .kernels.triton_forward import triton_turing_supported
+            use_fused = (
+                attention_backend != "sdpa"
+                and q_new.is_cuda
+                and q_new.dtype == torch.float16
+                and q_new.is_contiguous()
+                and torch.cuda.get_device_capability(q_new.device) == (7, 5)
+                and triton_turing_supported()
+                and self.k.dtype == torch.float16
+                and self.length >= 1023
+                and 16 <= q_new.shape[-1] <= 64
+            )
         if append_backend == "auto" and attention_backend in {"auto", "triton"}:
             from .attention import _is_measured_t4_runtime
             from .kernels.triton_decode import strided_decode_supported
@@ -254,9 +266,9 @@ class PreallocatedKVCache:
         if append_backend == "auto" and has_grad_inputs:
             use_fused = False
         if use_fused:
-            if attention_backend == "sdpa":
-                raise ValueError("append_backend='fused' requires attention_backend='auto' or 'triton'")
             if has_grad_inputs:
+                # Keep the inference-only contract explicit; the fallback below
+                # would otherwise silently change autograd behavior.
                 raise RuntimeError("append_backend='fused' is inference-only; disable gradients")
             from .kernels.triton_forward import triton_turing_supported
             from .kernels.triton_decode import attention_forward_strided_append
