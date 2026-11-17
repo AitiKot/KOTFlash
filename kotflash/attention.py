@@ -71,6 +71,13 @@ def _sdpa_expanded(q, k, v, *, causal: bool, scale: Optional[float]):
     return F.scaled_dot_product_attention(q, k, v, **kwargs)
 
 
+def _is_turing_fp16_gqa(q, k) -> bool:
+    """Avoid PyTorch's native-GQA MATH fallback on Turing FP16."""
+    if not q.is_cuda or q.dtype != torch.float16 or q.shape[1] == k.shape[1]:
+        return False
+    return torch.cuda.get_device_capability(q.device) == (7, 5)
+
+
 @lru_cache(maxsize=8)
 def _is_measured_t4_runtime(device_index: int) -> bool:
     """Cache immutable device/runtime checks outside the attention hot path."""
@@ -268,7 +275,12 @@ def attention(
     # copies. The auto route is deliberately limited to the exact measured
     # T4 shape; explicit backend="triton" enables the same kernel for other
     # supported short-query/long-cache SM75 shapes.
-    if backend in {"auto", "triton"} and strided_decode_supported(q, k, v):
+    if (
+        backend in {"auto", "triton"}
+        and q.is_cuda
+        and triton_turing_supported()
+        and strided_decode_supported(q, k, v)
+    ):
         needs_grad = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (q, k, v)
         )
@@ -306,6 +318,12 @@ def attention(
             check_int32_indexing(q=q.numel(), k=k.numel(), v=v.numel())
             return _TritonAttention.apply(q, k, v, causal, float(scale))
         if profile == "sdpa_expanded":
+            return _sdpa_expanded(q, k, v, causal=causal, scale=scale)
+        if _is_turing_fp16_gqa(q, k):
+            # PyTorch 2.6 native enable_gqa can fall back to the quadratic
+            # MATH implementation on SM75. Expanding KV heads lets SDPA pick
+            # its ordinary equal-head backend instead. Keep this out of
+            # explicit backend="sdpa" and preserve all exact measured routes.
             return _sdpa_expanded(q, k, v, causal=causal, scale=scale)
 
     # Conservative fallback for unprofiled devices and shapes.

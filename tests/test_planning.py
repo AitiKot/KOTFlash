@@ -63,6 +63,31 @@ def test_split_kv_envelope(sq, sk, d, causal):
     assert split_kv_plan(sq, sk, d, causal=causal) is None
 
 
+@pytest.mark.parametrize("sq,sk,d", [
+    (1, 256, 64),
+    (1, 512, 128),
+    (16, 512, 128),
+])
+def test_expanded_split_kv_decode_envelope(sq, sk, d):
+    # Expanded limits are opt-in; the default route remains conservative.
+    assert split_kv_plan(sq, sk, d, causal=False) is None
+
+    plan = split_kv_plan(
+        sq, sk, d, causal=False, min_sk=256, max_d=128
+    )
+    assert plan is not None
+    assert 1 <= plan.num_splits <= 16
+    covered = 0
+    for split in range(plan.num_splits):
+        start = split * plan.chunk_n
+        end = min(start + plan.chunk_n, sk)
+        assert start == covered
+        assert start < end
+        assert start + plan.blocks_per_split * plan.block_n >= end
+        covered = end
+    assert covered == sk
+
+
 def test_split_kv_partitions_without_gaps_or_empty_splits():
     lengths = list(range(1024, 3000, 7)) + [4096, 8191, 8192, 16384, 20000]
     for sk in lengths:

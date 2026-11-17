@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from kotflash import attention, triton_turing_supported
 from kotflash.attention import _t4_profile_backend
+import kotflash.attention as attention_module
 
 
 pytestmark = pytest.mark.skipif(
@@ -321,3 +322,61 @@ def test_auto_fused_preallocated_append_matches_expanded_sdpa_on_measured_t4():
         )
     assert cache.length == 2048
     torch.testing.assert_close(actual, expected, rtol=8e-3, atol=8e-3)
+
+@pytest.mark.parametrize(("kv_seq", "head_dim"), [(512, 128), (1024, 128)])
+def test_strided_preallocated_decode_supports_kv512_and_head_dim128(kv_seq, head_dim):
+    """Exercise the expanded Split-KV decode envelope needed by KOT-V2."""
+    from kotflash.cache import PreallocatedKVCache
+
+    torch.manual_seed(53)
+    batch, hq, hkv = 2, 16, 4
+    cache = PreallocatedKVCache(
+        batch, hkv, kv_seq * 2, head_dim,
+        device="cuda", dtype=torch.float16,
+    )
+    past_k = torch.randn(batch, hkv, kv_seq, head_dim, device="cuda", dtype=torch.float16)
+    past_v = torch.randn_like(past_k)
+    q = torch.randn(batch, hq, 1, head_dim, device="cuda", dtype=torch.float16)
+    cache.append(past_k, past_v, backend="torch")
+
+    k_view, v_view = cache.view()
+    assert not k_view.is_contiguous()
+    with torch.inference_mode():
+        actual = attention(q, k_view, v_view, causal=False, backend="triton")
+        expected = F.scaled_dot_product_attention(
+            q,
+            k_view.contiguous().repeat_interleave(hq // hkv, dim=1),
+            v_view.contiguous().repeat_interleave(hq // hkv, dim=1),
+            is_causal=False,
+        )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires an NVIDIA Turing GPU",
+)
+def test_auto_unprofiled_fp16_gqa_uses_expanded_sdpa(monkeypatch):
+    """Unprofiled SM75 GQA must not enter PyTorch's native-GQA MATH fallback."""
+    torch.manual_seed(59)
+    q = torch.randn(1, 8, 32, 128, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 64, 128, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
+
+    calls = {"expanded": 0}
+    original = attention_module._sdpa_expanded
+
+    def wrapped(*args, **kwargs):
+        calls["expanded"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module, "_sdpa_expanded", wrapped)
+    actual = attention(q, k, v, causal=False, backend="auto")
+    expected = F.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        is_causal=False,
+    )
+    assert calls["expanded"] == 1
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
