@@ -23,7 +23,9 @@ The defaults (16 Q heads, 4 KV heads, D=128, batch 1) are a starting profile
 based on the current project notes. Override them if the checkpoint config
 differs. The script records attention forward/backward results at 512, 1024,
 2048 and 4096 tokens, then attempts full synthetic decoder-block steps at
-512 and 1024. The block test includes projections, MLP, backward and AdamW,
+512, 1024, 2048 and 4096. Individual block runs that fail (for example, from
+an out-of-memory condition) are recorded and do not stop the remaining block
+profiles. The block test includes projections, MLP, backward and AdamW,
 but remains a one-block proxy, not a full KOT-V2 run.
 
 Use the results this way:
