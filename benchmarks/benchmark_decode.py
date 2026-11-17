@@ -99,10 +99,10 @@ def main() -> None:
         parser.error("All tensor dimensions must be positive.")
     if args.q_heads % args.kv_heads:
         parser.error("--q-heads must be divisible by --kv-heads.")
-    if not 16 <= args.head_dim <= 64:
-        parser.error("Split-KV decode benchmark requires 16 <= --head-dim <= 64.")
-    if args.kv_seq < 1024:
-        parser.error("Split-KV decode benchmark requires --kv-seq >= 1024.")
+    if not 16 <= args.head_dim <= 128:
+        parser.error("Decode benchmark requires 16 <= --head-dim <= 128.")
+    if args.kv_seq < 256:
+        parser.error("Split-KV decode benchmark requires --kv-seq >= 256.")
     if args.warmup < 1 or args.iterations < 1 or args.repeats < 3:
         parser.error("Use warmup >= 1, iterations >= 1 and repeats >= 3.")
     if torch.cuda.get_device_capability() != (7, 5) or not triton_turing_supported():
@@ -255,6 +255,11 @@ def main() -> None:
         "iterations_per_repeat": args.iterations,
         "repeats": args.repeats,
         "append_backend": args.append_backend,
+        "fused_append_expected_to_run": (
+            args.head_dim <= 64 and args.kv_seq >= 1024
+            and args.append_backend in {"auto", "fused"}
+        ),
+        "decode_kernel_envelope": "non-causal short-query Split-KV; q_len=1, head_dim<=128, kv_len>=256",
         "cuda_append_extension_requested": (
             args.append_backend == "cuda"
             or os.environ.get("KOTFLASH_ENABLE_CUDA_APPEND") == "1"
