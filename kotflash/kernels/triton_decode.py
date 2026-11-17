@@ -430,7 +430,7 @@ def strided_decode_supported(q, k, v) -> bool:
         return False
     if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape:
         return False
-    if q.shape[2] > 16 or k.shape[2] < 1024 or not 16 <= q.shape[-1] <= 64:
+    if q.shape[2] > 16 or k.shape[2] < 256 or not 16 <= q.shape[-1] <= 128:
         return False
     if q.shape[0] != k.shape[0] or q.shape[1] % k.shape[1]:
         return False
@@ -457,7 +457,9 @@ def attention_forward_strided_decode(q, k, v, *, scale: float):
         raise ValueError("strided KV-cache decode currently requires NVIDIA SM75")
     b, hq, sq, d = q.shape
     _, hkv, sk, _ = k.shape
-    plan = split_kv_plan(sq, sk, d, causal=False)
+    # Explicitly opt into the expanded inference envelope. The training and
+    # default planner paths retain their conservative historical thresholds.
+    plan = split_kv_plan(sq, sk, d, causal=False, min_sk=256, max_d=128)
     if plan is None:
         raise ValueError("shape is not eligible for Split-KV decode")
 
