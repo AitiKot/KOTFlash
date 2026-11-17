@@ -270,6 +270,7 @@ def attention(
     # supported short-query/long-cache SM75 shapes.
     if (
         backend in {"auto", "triton"}
+        and q.is_cuda
         and triton_turing_supported()
         and strided_decode_supported(q, k, v)
     ):
