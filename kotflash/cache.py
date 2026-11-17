@@ -269,10 +269,6 @@ class PreallocatedKVCache:
         if append_backend == "auto" and has_grad_inputs:
             use_fused = False
         if use_fused:
-            if has_grad_inputs:
-                # Keep the inference-only contract explicit; the fallback below
-                # would otherwise silently change autograd behavior.
-                raise RuntimeError("append_backend='fused' is inference-only; disable gradients")
             from .kernels.triton_forward import triton_turing_supported
             from .kernels.triton_decode import attention_forward_strided_append
             if not triton_turing_supported():
