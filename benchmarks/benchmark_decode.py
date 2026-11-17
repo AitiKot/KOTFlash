@@ -255,10 +255,10 @@ def main() -> None:
         "iterations_per_repeat": args.iterations,
         "repeats": args.repeats,
         "append_backend": args.append_backend,
-        "fused_append_expected_to_run": (
+        "preallocated_fused_candidate_shape_eligible": (
             args.head_dim <= 64 and args.kv_seq >= 1024
-            and args.append_backend in {"auto", "fused"}
         ),
+        "fused_candidate_requires_sm75_fp16_and_triton_32": True,
         "decode_kernel_envelope": "non-causal short-query Split-KV; q_len=1, head_dim<=128, kv_len>=256",
         "cuda_append_extension_requested": (
             args.append_backend == "cuda"
