@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from kotflash import attention, triton_turing_supported
 from kotflash.attention import _t4_profile_backend
+import kotflash.attention as attention_module
 
 
 pytestmark = pytest.mark.skipif(
@@ -350,4 +351,32 @@ def test_strided_preallocated_decode_supports_kv512_and_head_dim128(kv_seq, head
         )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires an NVIDIA Turing GPU",
+)
+def test_auto_unprofiled_fp16_gqa_uses_expanded_sdpa(monkeypatch):
+    """Unprofiled SM75 GQA must not enter PyTorch's native-GQA MATH fallback."""
+    torch.manual_seed(59)
+    q = torch.randn(1, 8, 32, 128, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 64, 128, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k)
 
+    calls = {"expanded": 0}
+    original = attention_module._sdpa_expanded
+
+    def wrapped(*args, **kwargs):
+        calls["expanded"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module, "_sdpa_expanded", wrapped)
+    actual = attention(q, k, v, causal=False, backend="auto")
+    expected = F.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        is_causal=False,
+    )
+    assert calls["expanded"] == 1
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
