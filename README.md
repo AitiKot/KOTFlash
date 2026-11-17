@@ -179,6 +179,17 @@ attention(q, k, v, *, causal=False, scale=None, backend='auto')
 
 The experimental Triton path currently requires CUDA SM75, FP16 and upstream Triton 3.2.x. General non-contiguous tensors are copied to contiguous buffers; the exception is the inference-only, stride-aware preallocated-cache decode kernel for short queries over long KV prefixes. `auto` uses narrow T4 profiles only on the measured PyTorch 2.6.0+cu124 / Triton 3.2.x stack and exact profiled shapes. The strided-cache route remains experimental, but its correctness and measured decode path were validated on a physical T4 on 2026-11-13. Other shapes and software stacks fall back to PyTorch SDPA.
 
+## KOT-V2 training profile
+
+To benchmark the attention geometry used by KOT-V2 on a Tesla T4, run
+`benchmarks/run_kotv2_t4_profile.sh`. The script checks the T4 / PyTorch
+2.6.0+cu124 / Triton 3.2.x environment and saves attention and synthetic
+decoder-block A/B reports under `artifacts/`. See
+[`docs/KOT_V2_TRAINING_OPTIMIZATION.md`](docs/KOT_V2_TRAINING_OPTIMIZATION.md)
+for the staged-context, DDP, MoE and memory plan. The profile defaults are
+configurable via `KOTV2_Q_HEADS`, `KOTV2_KV_HEADS`, `KOTV2_HEAD_DIM` and
+`KOTV2_BATCH`; verify them against the model config before running.
+
 ## Tests and benchmark
 
 Run CPU/API tests:
