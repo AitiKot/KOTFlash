@@ -17,13 +17,13 @@ if triton is not None:
     def _strided_decode_split(
         Q, K, V, PART_O, PART_LSE,
         BATCH: tl.constexpr,
-        SQ: tl.constexpr, SK: tl.constexpr,
+        SQ: tl.constexpr, SK,
         HQ: tl.constexpr, HKV: tl.constexpr,
         D: tl.constexpr, SCALE: tl.constexpr,
-        QSB: tl.constexpr, QSH: tl.constexpr, QSS: tl.constexpr, QSD: tl.constexpr,
-        KSB: tl.constexpr, KSH: tl.constexpr, KSS: tl.constexpr, KSD: tl.constexpr,
-        VSB: tl.constexpr, VSH: tl.constexpr, VSS: tl.constexpr, VSD: tl.constexpr,
-        CHUNK_N: tl.constexpr, BLOCKS_PER_SPLIT: tl.constexpr,
+        QSB, QSH, QSS, QSD,
+        KSB, KSH, KSS, KSD,
+        VSB, VSH, VSS, VSD,
+        CHUNK_N, BLOCKS_PER_SPLIT,
         BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
     ):
         """One CTA computes one (split, batch, query-head) partial result."""
@@ -109,15 +109,15 @@ if triton is not None:
     def _strided_decode_append_split(
         Q, K_CACHE, V_CACHE, NEW_K, NEW_V, PART_O, PART_LSE,
         BATCH: tl.constexpr,
-        SQ: tl.constexpr, SK_PAST: tl.constexpr, SK_TOTAL: tl.constexpr,
+        SQ: tl.constexpr, SK_PAST, SK_TOTAL,
         HQ: tl.constexpr, HKV: tl.constexpr,
         D: tl.constexpr, SCALE: tl.constexpr, GROUP: tl.constexpr,
-        QSB: tl.constexpr, QSH: tl.constexpr, QSS: tl.constexpr, QSD: tl.constexpr,
-        KSB: tl.constexpr, KSH: tl.constexpr, KSS: tl.constexpr, KSD: tl.constexpr,
-        VSB: tl.constexpr, VSH: tl.constexpr, VSS: tl.constexpr, VSD: tl.constexpr,
-        NKSB: tl.constexpr, NKSH: tl.constexpr, NKSS: tl.constexpr, NKSD: tl.constexpr,
-        NVSB: tl.constexpr, NVSH: tl.constexpr, NVSS: tl.constexpr, NVSD: tl.constexpr,
-        CHUNK_N: tl.constexpr, BLOCKS_PER_SPLIT: tl.constexpr,
+        QSB, QSH, QSS, QSD,
+        KSB, KSH, KSS, KSD,
+        VSB, VSH, VSS, VSD,
+        NKSB, NKSH, NKSS, NKSD,
+        NVSB, NVSH, NVSS, NVSD,
+        CHUNK_N, BLOCKS_PER_SPLIT,
         BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
     ):
         """Append one new K/V position and compute its Split-KV partial attention.
@@ -253,49 +253,85 @@ if triton is not None:
         offs_d = tl.arange(0, BD)
         offs_s = tl.arange(0, SPLIT_PAD)
 
-        lse_ptrs = (
-            PART_LSE
-            + (offs_s[:, None] * BATCH * HQ + pid_b * HQ + pid_h) * SQ
-            + offs_m[None, :]
-        )
-        lse_all = tl.load(
-            lse_ptrs,
-            mask=(offs_s[:, None] < NUM_SPLITS) & (offs_m[None, :] < SQ),
-            other=float("-inf"),
-        )
-        row_max = tl.max(lse_all, axis=0)
-        weights = tl.exp(lse_all - row_max[None, :])
-        weights = tl.where(
-            (offs_s[:, None] < NUM_SPLITS) & (offs_m[None, :] < SQ),
-            weights,
-            0.0,
-        )
-        denom = tl.sum(weights, axis=0)
-        safe_max = tl.where(denom > 0.0, row_max, 0.0)
-        safe_denom = tl.maximum(denom, 1.0)
-
-        acc = tl.zeros((BM, BD), tl.float32)
-        for split_idx in range(NUM_SPLITS):
-            lse_s = tl.load(
-                PART_LSE + (split_idx * BATCH * HQ + pid_b * HQ + pid_h) * SQ + offs_m,
-                mask=offs_m < SQ,
+        if SQ == 1:
+            # Decode has exactly one query row. Load all split LSE values and
+            # partial outputs once, then reduce in parallel instead of issuing
+            # a second LSE read and a dependent Python-style loop over splits.
+            lse_ptrs = PART_LSE + (
+                offs_s * BATCH * HQ + pid_b * HQ + pid_h
+            )
+            lse_all = tl.load(
+                lse_ptrs,
+                mask=offs_s < NUM_SPLITS,
                 other=float("-inf"),
             )
-            weight = tl.exp(lse_s - safe_max) / safe_denom
-            part_base = ((split_idx * BATCH + pid_b) * HQ + pid_h) * SQ * D
+            row_max = tl.max(lse_all, axis=0)
+            weights = tl.exp(lse_all - row_max)
+            weights = tl.where(offs_s < NUM_SPLITS, weights, 0.0)
+            denom = tl.sum(weights, axis=0)
+            safe_max = tl.where(denom > 0.0, row_max, 0.0)
+            safe_denom = tl.maximum(denom, 1.0)
+            weights = tl.exp(lse_all - safe_max) / safe_denom
+            weights = tl.where(offs_s < NUM_SPLITS, weights, 0.0)
+
+            part_base = (
+                offs_s * BATCH * HQ * D + (pid_b * HQ + pid_h) * D
+            )
+            part_ptrs = PART_O + part_base[:, None] + offs_d[None, :]
             part = tl.load(
-                PART_O + part_base + offs_m[:, None] * D + offs_d[None, :],
-                mask=(offs_m[:, None] < SQ) & (offs_d[None, :] < D),
+                part_ptrs,
+                mask=(offs_s[:, None] < NUM_SPLITS) & (offs_d[None, :] < D),
                 other=0.0,
             )
-            acc += weight[:, None] * part
+            acc = tl.sum(weights[:, None] * part, axis=0)
+            tl.store(
+                O + (pid_b * HQ + pid_h) * D + offs_d,
+                acc,
+                mask=offs_d < D,
+            )
+        else:
+            lse_ptrs = (
+                PART_LSE
+                + (offs_s[:, None] * BATCH * HQ + pid_b * HQ + pid_h) * SQ
+                + offs_m[None, :]
+            )
+            lse_all = tl.load(
+                lse_ptrs,
+                mask=(offs_s[:, None] < NUM_SPLITS) & (offs_m[None, :] < SQ),
+                other=float("-inf"),
+            )
+            row_max = tl.max(lse_all, axis=0)
+            weights = tl.exp(lse_all - row_max[None, :])
+            weights = tl.where(
+                (offs_s[:, None] < NUM_SPLITS) & (offs_m[None, :] < SQ),
+                weights,
+                0.0,
+            )
+            denom = tl.sum(weights, axis=0)
+            safe_max = tl.where(denom > 0.0, row_max, 0.0)
+            safe_denom = tl.maximum(denom, 1.0)
 
-        tl.store(
-            O + ((pid_b * HQ + pid_h) * SQ + offs_m[:, None]) * D + offs_d[None, :],
-            acc,
-            mask=(offs_m[:, None] < SQ) & (offs_d[None, :] < D),
-        )
+            acc = tl.zeros((BM, BD), tl.float32)
+            for split_idx in range(NUM_SPLITS):
+                lse_s = tl.load(
+                    PART_LSE + (split_idx * BATCH * HQ + pid_b * HQ + pid_h) * SQ + offs_m,
+                    mask=offs_m < SQ,
+                    other=float("-inf"),
+                )
+                weight = tl.exp(lse_s - safe_max) / safe_denom
+                part_base = ((split_idx * BATCH + pid_b) * HQ + pid_h) * SQ * D
+                part = tl.load(
+                    PART_O + part_base + offs_m[:, None] * D + offs_d[None, :],
+                    mask=(offs_m[:, None] < SQ) & (offs_d[None, :] < D),
+                    other=0.0,
+                )
+                acc += weight[:, None] * part
 
+            tl.store(
+                O + ((pid_b * HQ + pid_h) * SQ + offs_m[:, None]) * D + offs_d[None, :],
+                acc,
+                mask=(offs_m[:, None] < SQ) & (offs_d[None, :] < D),
+            )
 
 
 
